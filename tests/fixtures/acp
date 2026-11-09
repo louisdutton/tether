@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+set -eu
+agent=$1
+state=$2
+mkdir -p "$state"
+reply() { jq -cn --argjson id "$request_id" --argjson result "$1" '{jsonrpc:"2.0",id:$id,result:$result}'; }
+error() { jq -cn --argjson id "$request_id" --arg message "$1" '{jsonrpc:"2.0",id:$id,error:{code:-32602,message:$message}}'; }
+update() { jq -cn --arg sid "$sid" --argjson update "$1" '{jsonrpc:"2.0",method:"session/update",params:{sessionId:$sid,update:$update}}'; }
+config() {
+  model=$(jq -r '.model // "small"' "$state/$sid.json")
+  effort=$(jq -r '.effort // "low"' "$state/$sid.json")
+  jq -cn --arg model "$model" --arg effort "$effort" '[{id:"model",name:"Model",category:"model",type:"select",currentValue:$model,options:[{value:"small",name:"Small"},{value:"large",name:"Large"}]},{id:"effort",name:"Reasoning",category:"thought_level",type:"select",currentValue:$effort,options:[{value:"low",name:"Low"},{value:"high",name:"High"}]}]'
+}
+pending=''
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$state/requests.jsonl"
+  request_id=$(jq -c '.id // null' <<< "$line")
+  method=$(jq -r '.method // ""' <<< "$line")
+  sid=$(jq -r '.params.sessionId // ""' <<< "$line")
+  case "$method" in
+    initialize)
+      reply '{"protocolVersion":1,"agentCapabilities":{"loadSession":true,"promptCapabilities":{"image":true,"embeddedContext":true},"sessionCapabilities":{"list":{}}}}'
+      ;;
+    session/new)
+      count=$(cat "$state/counter" 2>/dev/null || printf 0)
+      count=$((count + 1)); printf '%s' "$count" > "$state/counter"
+      sid="$agent-$count"
+      jq --arg sid "$sid" '.params + {sessionId:$sid}' <<< "$line" > "$state/$sid.json"
+      update '{"sessionUpdate":"available_commands_update","availableCommands":[{"name":"compact","description":"Compact conversation"}]}'
+      reply "$(jq -cn --arg sid "$sid" --argjson config "$(config)" '{sessionId:$sid,configOptions:$config}')"
+      ;;
+    session/list)
+      sessions='[]'
+      for file in "$state/$agent-"*.json; do
+        [ -e "$file" ] || continue
+        sessions=$(jq --argjson item "$(jq '{sessionId,cwd,title:"Fixture session"}' "$file")" '. + [$item]' <<< "$sessions")
+      done
+      reply "$(jq -cn --argjson sessions "$sessions" '{sessions:$sessions}')"
+      ;;
+    session/load)
+      if [ ! -f "$state/$sid.json" ]; then error 'unknown session'; continue; fi
+      if [ -f "$state/$sid.history" ]; then
+        while IFS= read -r item; do update "$item"; done < "$state/$sid.history"
+      fi
+      reply "$(jq -cn --argjson config "$(config)" '{configOptions:$config}')"
+      ;;
+    session/set_config_option)
+      key=$(jq -r '.params.configId' <<< "$line")
+      value=$(jq -r '.params.value' <<< "$line")
+      if { [ "$key" = model ] && { [ "$value" = small ] || [ "$value" = large ]; }; } || { [ "$key" = effort ] && { [ "$value" = low ] || [ "$value" = high ]; }; }; then
+        jq --arg key "$key" --arg value "$value" '.[$key]=$value | if $key == "model" then .effort="low" else . end' "$state/$sid.json" > "$state/config.tmp"
+        mv "$state/config.tmp" "$state/$sid.json"
+        options=$(config)
+        update "$(jq -cn --argjson options "$options" '{sessionUpdate:"config_option_update",configOptions:$options}')"
+        reply "$(jq -cn --argjson options "$options" '{configOptions:$options}')"
+      else error 'invalid config value'; fi
+      ;;
+    session/prompt)
+      text=$(jq -r '[.params.prompt[] | select(.type == "text") | .text] | join("\n")' <<< "$line")
+      if [[ "$text" == *crash* ]]; then exit 7; fi
+      if [[ "$text" == *failure* ]]; then error 'fixture failed before completion'; continue; fi
+      # Native user echoes intentionally contain the handover. Tether must retain
+      # the authored input separately, without leaking the seed into its replay.
+      user=$(jq -cn --arg text "$text" '{sessionUpdate:"user_message_chunk",content:{type:"text",text:$text}}')
+      update "$user"
+      printf '%s\n' "$user" >> "$state/$sid.history"
+      if [[ "$text" == *slow* ]]; then pending=$request_id; pending_sid=$sid; continue; fi
+      update '{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"thinking"}}'
+      update '{"sessionUpdate":"plan","entries":[{"content":"Inspect repository","priority":"medium","status":"completed"}]}'
+      update '{"sessionUpdate":"tool_call","toolCallId":"tool-1","title":"Read file","kind":"read","status":"in_progress","rawInput":{"path":"README.md"}}'
+      update '{"sessionUpdate":"tool_call_update","toolCallId":"tool-1","status":"completed","content":[{"type":"diff","path":"README.md","oldText":"a","newText":"b"}]}'
+      assistant='{"sessionUpdate":"agent_message_chunk","messageId":"answer","content":{"type":"text","text":"hello"}}'
+      update "$assistant"
+      printf '%s\n' "$assistant" >> "$state/$sid.history"
+      if [[ "$text" == *limit* ]]; then reply '{"stopReason":"max_tokens"}'; else reply '{"stopReason":"end_turn"}'; fi
+      ;;
+    session/cancel)
+      if [ -n "$pending" ] && [ "$sid" = "$pending_sid" ]; then
+        request_id=$pending; pending=''; reply '{"stopReason":"cancelled"}'
+      fi
+      ;;
+    *) error 'unsupported method';;
+  esac
+done
