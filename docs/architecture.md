@@ -62,9 +62,10 @@ with unknown delivery; it is never retried automatically.
 A private per-agent JSON record stores native session directories, MCP settings
 and explicit config selections needed to load native conversations. Managed
 transcripts live in SQLite. Direct sessions use ACP's native load replay as their
-history; adoption/import retain the Tether identity. Standard session/list refreshes
-all configured agents, records unseen bindings without loading them, and reuses
-existing binding owners. Discovery depends on
+history; adoption/import retain the Tether identity. Standard session/list reads
+only the known catalog and does not query native agents. Explicit discovery via
+`_meta.tether.discover` refreshes configured agents, records unseen bindings without
+loading them, and reuses existing binding owners. Discovery depends on
 the agent advertising `session/list`; returning to a native conversation requires
 `loadSession` support.
 

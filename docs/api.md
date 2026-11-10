@@ -50,22 +50,35 @@ receive ACP's cancelled outcome; there is no approval UI.
 
 ## Authoritative session catalog
 
-`session/list` without a cursor refreshes every configured agent and drains its
-native pagination before applying the requested cwd filter and public pagination.
-The catalog preserves valid provider `updatedAt` timestamps in standard ACP session
-metadata and sorts by newest activity, then stable public ID. Undated sessions
-follow dated sessions; refresh, load and transcript replay do not create activity.
-Prompts and live turn events also record activity for agents without timestamps.
-Conversations inside the configured workspace root appear automatically; discovering one does
-not load it or execute a prompt. Use the returned public ID for load, resume,
-close, import and delete. IDs persist across refreshes and process restarts.
+`session/list` reads Tether's known catalog immediately, without querying native
+agents or waiting for discovery. Sessions created through Tether are included
+immediately, alongside previously discovered external conversations. Normal list
+refreshes and reconnects never discover additional external sessions.
+
+When `agentCapabilities._meta.tether.sessionDiscovery` is true, clients can request
+explicit discovery with `session/list` and `_meta: {"tether":{"discover":true}}`.
+This is a fresh-list operation: do not include a cursor. It queries each configured
+agent, drains native pagination and reconciles known identities and metadata before
+returning the first page of the unified catalog. Later pages use ordinary
+`session/list` with the returned cursor. Known catalog reads on other connections
+remain available while discovery runs. Discovery neither loads conversations nor
+executes prompts. The Codex adapter uses native scan-and-repair for this explicit
+operation, retaining discovery of conversations missing from its database index.
+
+The catalog preserves valid provider `updatedAt` timestamps and sorts by newest
+known activity, then stable public ID. Undated sessions follow dated sessions;
+refresh, load and transcript replay do not create activity. Prompts and live turn
+events also record activity. Changes made externally become visible when explicitly
+discovered or reported through a loaded provider session. Public IDs persist across
+refreshes and process restarts. Use them for load, resume, close, import and delete.
 
 Deduplication uses actual `(configured agent ID, native session ID)` bindings.
 All bindings of a managed cross-agent conversation resolve to its existing public
 ID, including inactive bindings. Similar titles or directories are not evidence
 of identity. Adoption reuses an existing catalog ID instead of duplicating it.
 
-`_meta.tether.catalogComplete` indicates whether every agent refreshed successfully;
+`_meta.tether.discoveryPerformed` distinguishes explicit discovery from known-catalog
+reads. During discovery, `catalogComplete` indicates whether every agent refreshed successfully;
 `catalogErrors` identifies unavailable/unsupported catalogs. Cached conversations
 remain visible during failures. Opaque cursors refer to a persisted snapshot of
 ordered public IDs, scoped to the cwd filter. Continued pages retain that ordering
@@ -145,7 +158,8 @@ Cancellation is a notification without an ID. The prompt remains pending until
 the agent settles it. Observed cancellation takes precedence over a racing
 successful completion.
 
-Use `session/list` to discover conversations and `session/load` to replay their
+Use `session/list` to browse known conversations, opt into discovery as described
+above to find external conversations, and use `session/load` to replay their
 history. There is no separate custom history/get endpoint. Load validates the
 stored cwd and includes current config options. Managed history remains readable
 when the agent is unavailable. Running work can be attached with unchanged MCP

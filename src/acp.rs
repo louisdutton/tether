@@ -223,7 +223,7 @@ async fn handle_request(
                 .delete(SessionDeleteCapabilities::new())
                 .resume(SessionResumeCapabilities::new())
                 .close(manager.supports_close().then(SessionCloseCapabilities::new)))
-            .meta([("tether".into(), json!({"version":1,"providers":true,"managedHistory":true,"agentSwitching":true,"directSessions":true}))].into_iter().collect::<Meta>());
+            .meta([("tether".into(), json!({"version":1,"providers":true,"managedHistory":true,"agentSwitching":true,"directSessions":true,"sessionDiscovery":true}))].into_iter().collect::<Meta>());
         return value(
             InitializeResponse::new(agent_client_protocol::schema::ProtocolVersion::V1)
                 .agent_info(Implementation::new("tether", env!("CARGO_PKG_VERSION")))
@@ -394,10 +394,23 @@ async fn handle_request(
             if request.cwd.as_ref().is_some_and(|p| !p.is_absolute()) {
                 return Err(Error::invalid_params().data("cwd must be absolute"));
             }
-            let page = manager
-                .list_filtered(request.cursor, request.cwd.as_deref())
-                .await
-                .map_err(mapped)?;
+            let discover = request
+                .meta
+                .as_ref()
+                .and_then(|m| m.get("tether"))
+                .and_then(|m| m.get("discover"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let page = if discover {
+                manager
+                    .discover_and_list(request.cursor, request.cwd.as_deref())
+                    .await
+            } else {
+                manager
+                    .list_filtered(request.cursor, request.cwd.as_deref())
+                    .await
+            }
+            .map_err(mapped)?;
             let sessions = page
                 .data
                 .into_iter()
@@ -409,7 +422,7 @@ async fn handle_request(
                 })
                 .collect();
             value(ListSessionsResponse::new(sessions).next_cursor(page.next_cursor).meta(
-                [("tether".into(), json!({"catalogComplete":page.failures.is_empty(),"catalogErrors":page.failures}))].into_iter().collect::<Meta>()
+                [("tether".into(), json!({"catalogComplete":page.failures.is_empty(),"discoveryPerformed":discover,"catalogErrors":page.failures}))].into_iter().collect::<Meta>()
             ))
         }
         "session/set_config_option" => {

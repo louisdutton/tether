@@ -1084,7 +1084,7 @@ async fn delete_fails_offline_and_retains_the_visible_session_and_history() {
             .iter()
             .any(|s| s.session_id.to_string() == session.id)
     );
-    assert!(serde_json::to_value(&list).unwrap()["_meta"]["tether"]["catalogComplete"] == false);
+    assert!(serde_json::to_value(&list).unwrap()["_meta"]["tether"]["discoveryPerformed"] == false);
     assert!(!f.manager.history(&session.id).await.unwrap().is_empty());
     assert!(
         f.directory
@@ -1155,6 +1155,7 @@ async fn session_list_exposes_standard_provider_activity_timestamp() {
     )
     .unwrap();
     std::fs::write(directory.join("external.history"), "").unwrap();
+    f.manager.discover_and_list(None, None).await.unwrap();
     let (peer, stop, task) = connected(&f).await;
     peer.initialize().await;
     let page = peer
@@ -1167,6 +1168,65 @@ async fn session_list_exposes_standard_provider_activity_timestamp() {
     assert_eq!(
         page.sessions[0].updated_at.as_deref(),
         Some("2026-11-10T10:00:00Z")
+    );
+    close(f, peer, stop, task).await;
+}
+
+#[tokio::test]
+async fn native_discovery_is_advertised_and_requires_explicit_list_metadata() {
+    let f = Fixture::new().await;
+    std::fs::write(
+        f.directory.path().join("codex/external.json"),
+        serde_json::to_vec(&json!({
+            "sessionId":"external", "cwd":f.directory.path(), "title":"External"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    std::fs::write(f.directory.path().join("codex/external.history"), "").unwrap();
+    let (peer, stop, task) = connected(&f).await;
+    let init = serde_json::to_value(peer.initialize().await).unwrap();
+    assert_eq!(
+        init["agentCapabilities"]["_meta"]["tether"]["sessionDiscovery"],
+        true
+    );
+    let known = peer
+        .cx
+        .send_request(ListSessionsRequest::new())
+        .block_task()
+        .await
+        .unwrap();
+    assert!(known.sessions.is_empty());
+    let discovery = peer
+        .cx
+        .send_request(
+            ListSessionsRequest::new().meta(
+                [("tether".into(), json!({"discover":true}))]
+                    .into_iter()
+                    .collect::<Meta>(),
+            ),
+        )
+        .block_task()
+        .await
+        .unwrap();
+    assert_eq!(discovery.sessions.len(), 1);
+    assert_eq!(
+        serde_json::to_value(&discovery).unwrap()["_meta"]["tether"]["discoveryPerformed"],
+        true
+    );
+    let known = peer
+        .cx
+        .send_request(ListSessionsRequest::new())
+        .block_task()
+        .await
+        .unwrap();
+    assert_eq!(
+        known.sessions[0].session_id,
+        discovery.sessions[0].session_id
+    );
+    assert_eq!(
+        serde_json::to_value(&known).unwrap()["_meta"]["tether"]["discoveryPerformed"],
+        false
     );
     close(f, peer, stop, task).await;
 }

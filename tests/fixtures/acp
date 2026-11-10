@@ -36,6 +36,7 @@ while IFS= read -r line; do
       reply "$(jq -cn --arg sid "$sid" --argjson config "$(config)" '{sessionId:$sid,configOptions:$config,modes:{currentModeId:"ask",availableModes:[{id:"ask",name:"Ask"},{id:"code",name:"Code"}]}}')"
       ;;
     session/list)
+      if [ -f "$state/list-delay" ]; then sleep "$(cat "$state/list-delay")"; fi
       if [ -f "$state/fail-list" ]; then error 'native catalog unavailable'; continue; fi
       shopt -s nullglob
       files=("$state/"*.json)

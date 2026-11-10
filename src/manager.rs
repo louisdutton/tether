@@ -551,7 +551,32 @@ impl Manager {
         cursor: Option<String>,
         cwd: Option<&Path>,
     ) -> Result<CatalogPage> {
-        let _guard = self.commands.lock().await;
+        self.catalog_list(cursor, cwd, false).await
+    }
+    pub async fn discover_and_list(
+        &self,
+        cursor: Option<String>,
+        cwd: Option<&Path>,
+    ) -> Result<CatalogPage> {
+        if cursor.is_some() {
+            return Err(Error::Invalid(
+                "discovery requires a fresh session list".into(),
+            ));
+        }
+        self.catalog_list(cursor, cwd, true).await
+    }
+    async fn catalog_list(
+        &self,
+        cursor: Option<String>,
+        cwd: Option<&Path>,
+        discover: bool,
+    ) -> Result<CatalogPage> {
+        // Known catalog reads must not wait for a provider discovery or active command.
+        let _guard = if discover {
+            Some(self.commands.lock().await)
+        } else {
+            None
+        };
         let cwd = cwd
             .map(|path| {
                 path.canonicalize()
@@ -580,66 +605,69 @@ impl Manager {
             return self.catalog_page(parts[1], &snapshot, offset).await;
         }
         let mut failures = vec![];
-        for (id, provider) in &self.providers {
-            if !provider.ready() || !provider.capabilities().list {
-                failures.push(CatalogFailure {
+        if discover {
+            for (id, provider) in &self.providers {
+                if !provider.ready() || !provider.capabilities().list {
+                    failures.push(CatalogFailure {
                     provider: id.clone(),
                     message:
                         "native catalog is unavailable or unsupported; showing cached conversations"
                             .into(),
                 });
-                continue;
-            }
-            let mut cursor = None;
-            let mut seen = std::collections::HashSet::new();
-            let mut discovered = vec![];
-            loop {
-                match provider.list(cursor.clone()).await {
-                    Ok(page) => {
-                        discovered.extend(page.data);
-                        match page.next_cursor {
-                            None => break,
-                            Some(next) if seen.insert(next.clone()) => cursor = Some(next),
-                            Some(_) => {
-                                failures.push(CatalogFailure {
-                                    provider: id.clone(),
-                                    message: "agent returned a repeated catalog cursor".into(),
-                                });
-                                break;
+                    continue;
+                }
+                let mut cursor = None;
+                let mut seen = std::collections::HashSet::new();
+                let mut discovered = vec![];
+                loop {
+                    match provider.list(cursor.clone()).await {
+                        Ok(page) => {
+                            discovered.extend(page.data);
+                            match page.next_cursor {
+                                None => break,
+                                Some(next) if seen.insert(next.clone()) => cursor = Some(next),
+                                Some(_) => {
+                                    failures.push(CatalogFailure {
+                                        provider: id.clone(),
+                                        message: "agent returned a repeated catalog cursor".into(),
+                                    });
+                                    break;
+                                }
                             }
                         }
-                    }
-                    Err(error) => {
-                        tracing::warn!(
-                            provider = id,
-                            ?error,
-                            "native session catalog refresh failed"
-                        );
-                        failures.push(CatalogFailure {
-                            provider: id.clone(),
-                            message: "native catalog refresh failed; showing cached conversations"
-                                .into(),
-                        });
-                        break;
+                        Err(error) => {
+                            tracing::warn!(
+                                provider = id,
+                                ?error,
+                                "native session catalog refresh failed"
+                            );
+                            failures.push(CatalogFailure {
+                                provider: id.clone(),
+                                message:
+                                    "native catalog refresh failed; showing cached conversations"
+                                        .into(),
+                            });
+                            break;
+                        }
                     }
                 }
-            }
-            for native in discovered {
-                if native.provider != *id || !self.allowed(&native.cwd) {
-                    continue;
-                }
-                if let Some(mut session) = self.db(|db| db.owner(id, &native.id))? {
-                    session.updated_at =
-                        latest_activity(session.updated_at, native.updated_at.clone());
-                    if session.provider == *id && !session.deletion_pending {
-                        session.title = native.title.clone().or(session.title);
-                        session.internal = native.internal;
+                for native in discovered {
+                    if native.provider != *id || !self.allowed(&native.cwd) {
+                        continue;
                     }
-                    self.db(|db| db.save(&session))?;
-                    continue;
-                }
-                if !native.internal {
-                    self.record(native, SessionKind::Direct, &[], vec![])?;
+                    if let Some(mut session) = self.db(|db| db.owner(id, &native.id))? {
+                        session.updated_at =
+                            latest_activity(session.updated_at, native.updated_at.clone());
+                        if session.provider == *id && !session.deletion_pending {
+                            session.title = native.title.clone().or(session.title);
+                            session.internal = native.internal;
+                        }
+                        self.db(|db| db.save(&session))?;
+                        continue;
+                    }
+                    if !native.internal {
+                        self.record(native, SessionKind::Direct, &[], vec![])?;
+                    }
                 }
             }
         }
@@ -699,8 +727,12 @@ impl Manager {
                     continue;
                 }
                 session.status = "unavailable".into();
-            } else {
-                session = self.get(&session.id).await?;
+            } else if !self
+                .providers
+                .get(&session.provider)
+                .is_some_and(|p| p.ready())
+            {
+                session.status = "unavailable".into();
             }
             data.push(session);
         }

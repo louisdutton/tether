@@ -124,7 +124,7 @@ def connect():
 
 peer = connect()
 try:
-    catalog = peer.call("session/list", {})
+    catalog = peer.call("session/list", {"_meta":{"tether":{"discover":True}}})
     assert catalog["_meta"]["tether"]["catalogComplete"], catalog
     sessions = catalog["sessions"]
     assert len(sessions) == 3, catalog
@@ -136,7 +136,7 @@ finally:
 
 peer = connect()
 try:
-    catalog = peer.call("session/list", {})
+    catalog = peer.call("session/list", {"_meta":{"tether":{"discover":True}}})
     restored = {s["_meta"]["tether"]["bindings"][0]["session_id"]: s["sessionId"] for s in catalog["sessions"]}
     assert mapping == restored
     print("Catalog IDs stable across Tether restart", flush=True)
@@ -149,7 +149,7 @@ try:
     print("Archived conversation load/close/resume: passed", flush=True)
     for native_id in original_ids:
         peer.call("session/delete", {"sessionId": mapping[native_id]})
-    assert peer.call("session/list", {})["sessions"] == []
+    assert peer.call("session/list", {"_meta":{"tether":{"discover":True}}})["sessions"] == []
     assert not list(home.glob("**/rollout-*.jsonl"))
     # The provider response and original files must agree with Tether's catalog.
     for native_id in original_ids:

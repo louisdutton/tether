@@ -38,7 +38,7 @@ async fn catalog_merges_all_bindings_without_title_or_native_id_collisions() {
         seed(&f, agent, "same-native-id", f.directory.path());
         std::fs::write(f.directory.path().join(agent).join("duplicate-list"), "").unwrap();
     }
-    let page = f.manager.list(None).await.unwrap();
+    let page = f.manager.discover_and_list(None, None).await.unwrap();
     assert!(page.failures.is_empty());
     assert_eq!(page.data.len(), 3);
     assert_eq!(page.data.iter().filter(|s| s.id == managed.id).count(), 1);
@@ -55,7 +55,7 @@ async fn catalog_merges_all_bindings_without_title_or_native_id_collisions() {
     ids.sort();
     let mut next: Vec<_> = f
         .manager
-        .list(None)
+        .discover_and_list(None, None)
         .await
         .unwrap()
         .data
@@ -67,7 +67,7 @@ async fn catalog_merges_all_bindings_without_title_or_native_id_collisions() {
     f.close().await;
     let manager = Fixture::connect(f.directory.path()).await;
     let mut restored: Vec<_> = manager
-        .list(None)
+        .discover_and_list(None, None)
         .await
         .unwrap()
         .data
@@ -85,7 +85,7 @@ async fn discovered_ids_support_lifecycle_and_delete_real_native_records() {
     for agent in ["codex", "claude"] {
         seed(&f, agent, "external", f.directory.path());
     }
-    let page = f.manager.list(None).await.unwrap();
+    let page = f.manager.discover_and_list(None, None).await.unwrap();
     assert_eq!(page.data.len(), 2);
     for session in page.data {
         f.manager
@@ -124,7 +124,14 @@ async fn discovered_ids_support_lifecycle_and_delete_real_native_records() {
                 .exists()
         );
     }
-    assert!(f.manager.list(None).await.unwrap().data.is_empty());
+    assert!(
+        f.manager
+            .discover_and_list(None, None)
+            .await
+            .unwrap()
+            .data
+            .is_empty()
+    );
     for agent in ["codex", "claude"] {
         assert!(
             !f.requests(agent)
@@ -148,7 +155,11 @@ async fn catalog_drains_agent_pages_then_filters_before_public_pagination() {
             seed(&f, agent, &format!("external-{index}"), cwd);
         }
     }
-    let first = f.manager.list_filtered(None, Some(&claude)).await.unwrap();
+    let first = f
+        .manager
+        .discover_and_list(None, Some(&claude))
+        .await
+        .unwrap();
     assert_eq!(first.data.len(), 50);
     assert!(first.data.iter().all(|s| s.provider == "claude"));
     let second = f
@@ -180,13 +191,18 @@ async fn catalog_drains_agent_pages_then_filters_before_public_pagination() {
 async fn failed_catalog_refresh_preserves_cached_ids_and_reports_incompleteness() {
     let f = Fixture::new().await;
     seed(&f, "codex", "external", f.directory.path());
-    let before = f.manager.list(None).await.unwrap().data[0].id.clone();
+    let before = f.manager.discover_and_list(None, None).await.unwrap().data[0]
+        .id
+        .clone();
     std::fs::write(f.directory.path().join("codex/fail-list"), "").unwrap();
-    let failed = f.manager.list(None).await.unwrap();
+    let failed = f.manager.discover_and_list(None, None).await.unwrap();
     assert_eq!(failed.data[0].id, before);
     assert_eq!(failed.failures[0].provider, "codex");
     std::fs::remove_file(f.directory.path().join("codex/fail-list")).unwrap();
-    assert_eq!(f.manager.list(None).await.unwrap().data[0].id, before);
+    assert_eq!(
+        f.manager.discover_and_list(None, None).await.unwrap().data[0].id,
+        before
+    );
     f.close().await;
 }
 
@@ -226,7 +242,7 @@ async fn unsupported_binding_prevents_all_deletion_and_keeps_the_session_visible
         f.manager.delete(&session.id).await,
         Err(Error::Deletion(_))
     ));
-    let visible = f.manager.list(None).await.unwrap();
+    let visible = f.manager.discover_and_list(None, None).await.unwrap();
     assert_eq!(visible.data.len(), 1);
     assert_eq!(visible.data[0].id, session.id);
     assert!(
@@ -269,7 +285,7 @@ async fn partial_deletion_remains_visible_across_restart_and_retries_only_remain
         f.manager.delete(&session.id).await,
         Err(Error::Deletion(_))
     ));
-    let visible = f.manager.list(None).await.unwrap();
+    let visible = f.manager.discover_and_list(None, None).await.unwrap();
     assert_eq!(visible.data.len(), 1);
     assert_eq!(visible.data[0].id, session.id);
     assert!(visible.data[0].bindings[0].deleted);
@@ -284,10 +300,20 @@ async fn partial_deletion_remains_visible_across_restart_and_retries_only_remain
     ));
     f.close().await;
     let manager = Fixture::connect(f.directory.path()).await;
-    assert_eq!(manager.list(None).await.unwrap().data[0].id, session.id);
+    assert_eq!(
+        manager.discover_and_list(None, None).await.unwrap().data[0].id,
+        session.id
+    );
     std::fs::remove_file(f.directory.path().join("claude/fail-delete")).unwrap();
     manager.delete(&session.id).await.unwrap();
-    assert!(manager.list(None).await.unwrap().data.is_empty());
+    assert!(
+        manager
+            .discover_and_list(None, None)
+            .await
+            .unwrap()
+            .data
+            .is_empty()
+    );
     assert_eq!(
         std::fs::read_to_string(f.directory.path().join("codex/delete-requests"))
             .unwrap()
@@ -314,7 +340,7 @@ async fn native_command_success_is_rejected_if_the_conversation_still_exists() {
         f.manager.delete(&session.id).await,
         Err(Error::Deletion(_))
     ));
-    let page = f.manager.list(None).await.unwrap();
+    let page = f.manager.discover_and_list(None, None).await.unwrap();
     assert_eq!(page.data[0].id, session.id);
     assert!(
         page.data[0]
@@ -350,7 +376,7 @@ async fn internal_metadata_hides_existing_cached_guardians_without_deleting_orig
     for id in ["guardian", "real-chat"] {
         seed(&f, "codex", id, f.directory.path());
     }
-    let original = f.manager.list(None).await.unwrap();
+    let original = f.manager.discover_and_list(None, None).await.unwrap();
     assert_eq!(original.data.len(), 2);
     metadata(&f, "codex", "guardian", Some("2026-11-10T10:00:00Z"), true);
     metadata(
@@ -360,7 +386,7 @@ async fn internal_metadata_hides_existing_cached_guardians_without_deleting_orig
         Some("2026-11-10T09:00:00Z"),
         false,
     );
-    let page = f.manager.list(None).await.unwrap();
+    let page = f.manager.discover_and_list(None, None).await.unwrap();
     assert_eq!(page.data.len(), 1);
     assert_eq!(page.data[0].binding().session_id, "real-chat");
     assert_eq!(page.data[0].title.as_deref(), Some("Guardian review"));
@@ -370,7 +396,7 @@ async fn internal_metadata_hides_existing_cached_guardians_without_deleting_orig
     std::fs::write(f.directory.path().join("codex/fail-list"), "").unwrap();
     f.close().await;
     let manager = Fixture::connect(f.directory.path()).await;
-    let page = manager.list(None).await.unwrap();
+    let page = manager.discover_and_list(None, None).await.unwrap();
     assert_eq!(page.data.len(), 1);
     assert!(!page.failures.is_empty());
     manager.shutdown().await;
@@ -387,7 +413,7 @@ async fn catalog_preserves_provider_recency_and_does_not_bump_history_reads_or_r
         seed(&f, agent, id, f.directory.path());
         metadata(&f, agent, id, Some(time), false);
     }
-    let first = f.manager.list(None).await.unwrap();
+    let first = f.manager.discover_and_list(None, None).await.unwrap();
     assert_eq!(
         first
             .data
@@ -398,10 +424,10 @@ async fn catalog_preserves_provider_recency_and_does_not_bump_history_reads_or_r
     );
     let timestamp = first.data[0].updated_at.clone();
     f.manager.history(&first.data[0].id).await.unwrap();
-    let same = f.manager.list(None).await.unwrap();
+    let same = f.manager.discover_and_list(None, None).await.unwrap();
     assert_eq!(timestamp, same.data[0].updated_at);
     metadata(&f, "codex", "older", Some("2026-11-10T11:00:00Z"), false);
-    let refreshed = f.manager.list(None).await.unwrap();
+    let refreshed = f.manager.discover_and_list(None, None).await.unwrap();
     assert_eq!(refreshed.data[0].binding().session_id, "older");
     assert_eq!(refreshed.data[0].id, first.data[1].id);
     let expected = refreshed
@@ -413,7 +439,7 @@ async fn catalog_preserves_provider_recency_and_does_not_bump_history_reads_or_r
     let manager = Fixture::connect(f.directory.path()).await;
     assert_eq!(
         manager
-            .list(None)
+            .discover_and_list(None, None)
             .await
             .unwrap()
             .data
@@ -433,7 +459,7 @@ async fn recency_pages_use_persisted_snapshots_across_activity_insertion_deletio
         seed(&f, "codex", &id, f.directory.path());
         metadata(&f, "codex", &id, Some("2026-11-10T09:00:00Z"), false);
     }
-    let first = f.manager.list(None).await.unwrap();
+    let first = f.manager.discover_and_list(None, None).await.unwrap();
     assert_eq!(first.data.len(), 50);
     let cursor = first.next_cursor.clone().unwrap();
     let mut expected: Vec<_> = f
@@ -458,7 +484,7 @@ async fn recency_pages_use_persisted_snapshots_across_activity_insertion_deletio
     expected.remove(1);
     seed(&f, "codex", "inserted", f.directory.path());
     metadata(&f, "codex", "inserted", Some("2026-11-10T13:00:00Z"), false);
-    let refreshed = f.manager.list(None).await.unwrap();
+    let refreshed = f.manager.discover_and_list(None, None).await.unwrap();
     assert_eq!(refreshed.data[0].binding().session_id, "inserted");
     assert_eq!(refreshed.data[1].id, remaining.id);
     f.close().await;
@@ -477,4 +503,69 @@ async fn recency_pages_use_persisted_snapshots_across_activity_insertion_deletio
     );
     assert!(manager.list(Some("v2:invalid:1".into())).await.is_err());
     manager.shutdown().await;
+}
+
+#[tokio::test]
+async fn known_catalog_never_discovers_or_queries_native_agents() {
+    let f = Fixture::new().await;
+    let managed = f.create("codex", SessionKind::Managed).await;
+    seed(&f, "codex", "external-manual", f.directory.path());
+    let before = [f.requests("codex").len(), f.requests("claude").len()];
+    let known = f.manager.list(None).await.unwrap();
+    assert_eq!(known.data.len(), 1);
+    assert_eq!(known.data[0].id, managed.id);
+    assert_eq!(
+        before,
+        [f.requests("codex").len(), f.requests("claude").len()]
+    );
+
+    let discovered = f.manager.discover_and_list(None, None).await.unwrap();
+    assert_eq!(discovered.data.len(), 2);
+    let ids: Vec<_> = discovered.data.iter().map(|s| s.id.clone()).collect();
+    let before = [f.requests("codex").len(), f.requests("claude").len()];
+    std::fs::write(f.directory.path().join("codex/fail-list"), "").unwrap();
+    let known = f.manager.list(None).await.unwrap();
+    assert_eq!(
+        known.data.iter().map(|s| s.id.clone()).collect::<Vec<_>>(),
+        ids
+    );
+    assert!(known.failures.is_empty());
+    assert_eq!(
+        before,
+        [f.requests("codex").len(), f.requests("claude").len()]
+    );
+    assert!(
+        f.manager
+            .discover_and_list(Some("invalid".into()), None)
+            .await
+            .is_err()
+    );
+    f.close().await;
+}
+
+#[tokio::test]
+async fn known_catalog_remains_available_during_slow_discovery() {
+    let f = Fixture::new().await;
+    let managed = f.create("codex", SessionKind::Managed).await;
+    std::fs::write(f.directory.path().join("codex/list-delay"), "1").unwrap();
+    let manager = f.manager.clone();
+    let discovery = tokio::spawn(async move { manager.discover_and_list(None, None).await });
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while !f
+            .requests("codex")
+            .iter()
+            .any(|r| r["method"] == "session/list")
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let page = tokio::time::timeout(std::time::Duration::from_millis(300), f.manager.list(None))
+        .await
+        .expect("known listing must not wait for discovery")
+        .unwrap();
+    assert_eq!(page.data[0].id, managed.id);
+    discovery.await.unwrap().unwrap();
+    f.close().await;
 }
