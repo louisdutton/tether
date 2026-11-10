@@ -431,6 +431,8 @@ impl Manager {
             ));
         }
         let session = Session {
+            updated_at: native.updated_at,
+            internal: native.internal,
             deletion_pending: false,
             deletion_error: None,
             mcp_servers,
@@ -549,17 +551,34 @@ impl Manager {
         cursor: Option<String>,
         cwd: Option<&Path>,
     ) -> Result<CatalogPage> {
-        let after = cursor
-            .as_deref()
-            .map(|cursor| {
-                let id = cursor
-                    .strip_prefix("v1:")
-                    .ok_or_else(|| Error::Invalid("invalid catalog cursor".into()))?;
-                Uuid::parse_str(id).map_err(|_| Error::Invalid("invalid catalog cursor".into()))?;
-                Ok::<_, Error>(id)
-            })
-            .transpose()?;
         let _guard = self.commands.lock().await;
+        let cwd = cwd
+            .map(|path| {
+                path.canonicalize()
+                    .map(|p| p.to_string_lossy().into_owned())
+            })
+            .transpose()
+            .map_err(|_| Error::Invalid("cwd is unavailable".into()))?;
+        if let Some(cursor) = cursor {
+            let parts: Vec<_> = cursor.split(':').collect();
+            if parts.len() != 3 || parts[0] != "v2" || Uuid::parse_str(parts[1]).is_err() {
+                return Err(Error::Invalid(
+                    "invalid catalog cursor; refresh the session list".into(),
+                ));
+            }
+            let offset: usize = parts[2]
+                .parse()
+                .map_err(|_| Error::Invalid("invalid catalog cursor".into()))?;
+            let snapshot = self.db(|db| db.catalog(parts[1]))?.ok_or_else(|| {
+                Error::Invalid("catalog cursor expired; refresh the session list".into())
+            })?;
+            if snapshot.cwd != cwd || offset >= snapshot.ids.len() {
+                return Err(Error::Invalid(
+                    "catalog cursor does not match this session list".into(),
+                ));
+            }
+            return self.catalog_page(parts[1], &snapshot, offset).await;
+        }
         let mut failures = vec![];
         for (id, provider) in &self.providers {
             if !provider.ready() || !provider.capabilities().list {
@@ -610,37 +629,75 @@ impl Manager {
                     continue;
                 }
                 if let Some(mut session) = self.db(|db| db.owner(id, &native.id))? {
+                    session.updated_at =
+                        latest_activity(session.updated_at, native.updated_at.clone());
                     if session.provider == *id && !session.deletion_pending {
                         session.title = native.title.clone().or(session.title);
-                        self.db(|db| db.save(&session))?;
+                        session.internal = native.internal;
                     }
+                    self.db(|db| db.save(&session))?;
                     continue;
                 }
-                self.record(native, SessionKind::Direct, &[], vec![])?;
+                if !native.internal {
+                    self.record(native, SessionKind::Direct, &[], vec![])?;
+                }
             }
         }
         let mut sessions: Vec<_> = self
             .db(|db| db.sessions())?
             .into_iter()
+            .filter(|s| !s.internal)
             .filter(|s| self.allowed(&s.cwd) || s.deletion_pending || s.deletion_error.is_some())
             .filter(|s| {
-                cwd.is_none_or(|cwd| {
-                    cwd.canonicalize()
+                cwd.as_ref().is_none_or(|cwd| {
+                    Path::new(&s.cwd)
+                        .canonicalize()
                         .ok()
-                        .is_some_and(|path| Path::new(&s.cwd).canonicalize().ok() == Some(path))
+                        .is_some_and(|path| path.to_string_lossy().as_ref() == cwd)
                 })
             })
-            .filter(|s| after.is_none_or(|after| s.id.as_str() > after))
             .collect();
-        sessions.sort_by(|a, b| a.id.cmp(&b.id));
-        let more = sessions.len() > 50;
-        sessions.truncate(50);
-        let next_cursor = more.then(|| format!("v1:{}", sessions.last().unwrap().id));
+        sessions.sort_by(|a, b| {
+            b.updated_at
+                .as_deref()
+                .and_then(activity_timestamp)
+                .cmp(&a.updated_at.as_deref().and_then(activity_timestamp))
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        let snapshot = CatalogSnapshot {
+            ids: sessions.into_iter().map(|s| s.id).collect(),
+            cwd,
+            failures,
+        };
+        let id = Uuid::new_v4().to_string();
+        if snapshot.ids.len() > 50 {
+            self.db(|db| db.save_catalog(&id, &snapshot))?;
+        }
+        self.catalog_page(&id, &snapshot, 0).await
+    }
+    async fn catalog_page(
+        &self,
+        id: &str,
+        snapshot: &CatalogSnapshot,
+        mut offset: usize,
+    ) -> Result<CatalogPage> {
         let mut data = vec![];
-        for mut session in sessions {
+        while offset < snapshot.ids.len() && data.len() < 50 {
+            let session_id = &snapshot.ids[offset];
+            offset += 1;
+            // A deletion or internal classification after the snapshot must not resurrect a row.
+            let Some(mut session) = self.db(|db| db.get(session_id))? else {
+                continue;
+            };
+            if session.internal {
+                continue;
+            }
             if session.deletion_pending {
                 session.status = "deletion_failed".into();
             } else if !self.allowed(&session.cwd) {
+                if session.deletion_error.is_none() {
+                    continue;
+                }
                 session.status = "unavailable".into();
             } else {
                 session = self.get(&session.id).await?;
@@ -649,8 +706,8 @@ impl Manager {
         }
         Ok(CatalogPage {
             data,
-            next_cursor,
-            failures,
+            next_cursor: (offset < snapshot.ids.len()).then(|| format!("v2:{id}:{offset}")),
+            failures: snapshot.failures.clone(),
         })
     }
     pub async fn get(&self, id: &str) -> Result<Session> {
@@ -663,6 +720,7 @@ impl Manager {
             Some(provider) if provider.ready() => match self.native(&session).await {
                 Ok(native) => {
                     session.title = native.title.or(session.title);
+                    session.updated_at = latest_activity(session.updated_at, native.updated_at);
                     native.status
                 }
                 Err(_) => "unavailable".into(),
@@ -945,6 +1003,7 @@ impl Manager {
             session.pending_turn = Some(native_turn.clone());
         }
         session.status = "running".into();
+        session.updated_at = Some(activity_now());
         let turn_id = self.db(|db| {
             db.transaction(|db| {
                 let turn_id = if session.kind == SessionKind::Managed {
@@ -1027,6 +1086,28 @@ impl Manager {
         };
         if session.deletion_pending || session.provider != provider || !self.allowed(&session.cwd) {
             return Ok(());
+        }
+        if matches!(
+            event.kind.as_str(),
+            "message.assistant"
+                | "message.user"
+                | "message.delta"
+                | "tool.activity"
+                | "turn.completed"
+                | "turn.interrupted"
+                | "turn.failed"
+        ) {
+            session.updated_at = Some(activity_now());
+            self.db(|db| db.save(&session))?;
+        }
+        if event.kind == "acp.session_update"
+            && event.data["sessionUpdate"] == "session_info_update"
+        {
+            session.updated_at = latest_activity(
+                session.updated_at,
+                event.data["updatedAt"].as_str().map(str::to_owned),
+            );
+            self.db(|db| db.save(&session))?;
         }
         event.session_id = Some(session.id.clone());
         if event.kind == "acp.session_update"

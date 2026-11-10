@@ -50,9 +50,13 @@ receive ACP's cancelled outcome; there is no approval UI.
 
 ## Authoritative session catalog
 
-`session/list` refreshes every configured agent and drains its native pagination
-before applying the requested cwd filter and public pagination. Conversations
-inside the configured workspace root appear automatically; discovering one does
+`session/list` without a cursor refreshes every configured agent and drains its
+native pagination before applying the requested cwd filter and public pagination.
+The catalog preserves valid provider `updatedAt` timestamps in standard ACP session
+metadata and sorts by newest activity, then stable public ID. Undated sessions
+follow dated sessions; refresh, load and transcript replay do not create activity.
+Prompts and live turn events also record activity for agents without timestamps.
+Conversations inside the configured workspace root appear automatically; discovering one does
 not load it or execute a prompt. Use the returned public ID for load, resume,
 close, import and delete. IDs persist across refreshes and process restarts.
 
@@ -63,10 +67,19 @@ of identity. Adoption reuses an existing catalog ID instead of duplicating it.
 
 `_meta.tether.catalogComplete` indicates whether every agent refreshed successfully;
 `catalogErrors` identifies unavailable/unsupported catalogs. Cached conversations
-remain visible during failures. Cursors are opaque. The supplied Codex adapter
-includes active and archived conversations, every model provider and every native
-source kind. Other adapters must expose their complete native catalog to provide
-the same coverage. The former `_tether/providers/sessions` discovery route is
+remain visible during failures. Opaque cursors refer to a persisted snapshot of
+ordered public IDs, scoped to the cwd filter. Continued pages retain that ordering
+across concurrent activity and restarts; newly created sessions appear on a fresh
+list. Deleted and internally classified sessions are skipped. Snapshots expire
+after 30 minutes and at most 128 are retained; invalid or expired cursors return
+an explicit refresh-required error. Older ID-based cursors must also be refreshed.
+The supplied Codex adapter includes active and archived conversations and every
+model provider. It classifies Guardian approval-review subagents by native source
+metadata (`subAgent.other == "guardian"`), allowing Tether to omit them from public
+lists and reclassify existing cached records without deleting original data.
+A user conversation titled “Guardian review” remains visible. Other subagent
+sources are retained. This classification is not inferred from chat titles. Other
+adapters must expose their complete native catalog to provide the same coverage. The former `_tether/providers/sessions` discovery route is
 removed; clients use standard `session/list`.
 
 ## Standard configuration

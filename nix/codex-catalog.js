@@ -23,7 +23,11 @@
           sessionId: thread.id,
           cwd: thread.cwd,
           title: (thread.name ?? thread.preview) || null,
-          updatedAt: new Date(thread.updatedAt * 1000).toISOString()
+          updatedAt: Number.isFinite(thread.updatedAt) ? new Date(thread.updatedAt * 1000).toISOString() : null,
+          _meta: { tether: { internal:
+            thread.source?.subAgent?.other === "guardian" ||
+            thread.source?.subagent?.other === "guardian"
+          } }
         })),
       nextCursor: next ? Buffer.from(JSON.stringify(next)).toString("base64url") : null
     };

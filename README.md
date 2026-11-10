@@ -18,7 +18,7 @@ retaining one session identity and transcript.
 - Persistent managed history, including original prompt content, readable when
   an agent is unavailable.
 - Separate native session bindings and bounded text handover between agents.
-- One binding-deduplicated session catalog across configured agents, with stable IDs for native and managed conversations.
+- One binding-deduplicated session catalog across configured agents, with stable IDs, provider activity timestamps, newest-first snapshot pagination, and source-based exclusion of internal Codex Guardian reviewers.
 - Verified permanent native deletion; unsupported or failed deletion returns an error and keeps the session visible.
 - Direct session adoption and managed import where supported.
 

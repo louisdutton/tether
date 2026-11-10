@@ -27,6 +27,7 @@ impl Store {
         db.execute_batch(
             "PRAGMA locking_mode=EXCLUSIVE; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
             CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, body TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS catalog_snapshots (id TEXT PRIMARY KEY, body TEXT NOT NULL, created_at INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS turns (
                 sequence INTEGER PRIMARY KEY AUTOINCREMENT,
                 id TEXT NOT NULL UNIQUE, session_id TEXT NOT NULL,
@@ -125,6 +126,22 @@ impl Store {
             .query_map([], |r| r.get::<_, String>(0))?
             .map(|r| Ok(serde_json::from_str(&r?)?))
             .collect()
+    }
+
+    pub fn save_catalog(&self, id: &str, snapshot: &crate::model::CatalogSnapshot) -> Result<()> {
+        self.transaction(|db| {
+            db.0.execute("DELETE FROM catalog_snapshots WHERE created_at < unixepoch() - 1800", [])?;
+            db.0.execute("INSERT INTO catalog_snapshots VALUES (?1, ?2, unixepoch())",
+                params![id, serde_json::to_string(snapshot)?])?;
+            db.0.execute("DELETE FROM catalog_snapshots WHERE id NOT IN (SELECT id FROM catalog_snapshots ORDER BY created_at DESC, rowid DESC LIMIT 128)", [])?;
+            Ok(())
+        })
+    }
+    pub fn catalog(&self, id: &str) -> Result<Option<crate::model::CatalogSnapshot>> {
+        let body: Option<String> = self.0.query_row(
+            "SELECT body FROM catalog_snapshots WHERE id=?1 AND created_at >= unixepoch() - 1800",
+            [id], |r| r.get(0)).optional()?;
+        body.map(|s| Ok(serde_json::from_str(&s)?)).transpose()
     }
 
     pub fn owner(&self, provider: &str, native: &str) -> Result<Option<Session>> {

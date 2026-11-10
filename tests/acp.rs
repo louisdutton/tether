@@ -1140,3 +1140,33 @@ async fn closing_invalidates_other_clients_without_detaching_a_later_resume() {
     let _ = second_task.await;
     close(f, first, first_stop, first_task).await;
 }
+
+#[tokio::test]
+async fn session_list_exposes_standard_provider_activity_timestamp() {
+    let f = Fixture::new().await;
+    let directory = f.directory.path().join("codex");
+    std::fs::write(
+        directory.join("external.json"),
+        serde_json::to_vec(&json!({
+            "sessionId":"external", "cwd":f.directory.path(), "title":"External chat",
+            "updatedAt":"2026-11-10T10:00:00Z"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    std::fs::write(directory.join("external.history"), "").unwrap();
+    let (peer, stop, task) = connected(&f).await;
+    peer.initialize().await;
+    let page = peer
+        .cx
+        .send_request(ListSessionsRequest::new())
+        .block_task()
+        .await
+        .unwrap();
+    assert_eq!(page.sessions.len(), 1);
+    assert_eq!(
+        page.sessions[0].updated_at.as_deref(),
+        Some("2026-11-10T10:00:00Z")
+    );
+    close(f, peer, stop, task).await;
+}

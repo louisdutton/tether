@@ -39,7 +39,7 @@ while IFS= read -r line; do
       if [ -f "$state/fail-list" ]; then error 'native catalog unavailable'; continue; fi
       shopt -s nullglob
       files=("$state/"*.json)
-      sessions=$(jq -s '[.[] | select(has("sessionId") and has("cwd")) | {sessionId,cwd,title:(.title // "Fixture session")}]' "${files[@]}" </dev/null)
+      sessions=$(jq -s '[.[] | select(has("sessionId") and has("cwd")) | {sessionId,cwd,title:(.title // "Fixture session"),updatedAt,_meta}]' "${files[@]}" </dev/null)
       if [ -f "$state/duplicate-list" ]; then sessions=$(jq '. + .' <<< "$sessions"); fi
       offset=$(jq -r '.params.cursor // "0"' <<< "$line")
       size=$(cat "$state/page-size" 2>/dev/null || printf 10000)

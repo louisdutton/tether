@@ -404,6 +404,7 @@ async fn handle_request(
                 .map(|s| {
                     SessionInfo::new(s.id.clone(), &s.cwd)
                         .title(s.title.clone())
+                        .updated_at(s.updated_at.clone())
                         .meta(metadata(&s))
                 })
                 .collect();

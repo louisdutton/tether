@@ -133,6 +133,12 @@ impl Shared {
             SessionUpdate::SessionInfoUpdate(info) => {
                 // The SDK preserves omitted versus cleared fields; use the wire form.
                 let info = serde_json::to_value(info)?;
+                if let Some(timestamp) = info.get("updatedAt").and_then(|v| v.as_str()) {
+                    record.session.updated_at = crate::model::latest_activity(
+                        record.session.updated_at.clone(),
+                        Some(timestamp.into()),
+                    );
+                }
                 if let Some(title) = info.get("title") {
                     record.session.title = title.as_str().map(str::to_owned);
                 }
@@ -692,6 +698,8 @@ impl Provider for AcpProvider {
             .await?,
         )?;
         let session = ProviderSession {
+            updated_at: Some(crate::model::activity_now()),
+            internal: false,
             id: result.session_id.to_string(),
             provider: self.id.clone(),
             cwd: request.cwd,
@@ -738,6 +746,16 @@ impl Provider for AcpProvider {
             let mut records = self.shared.records.lock().unwrap();
             for info in result.sessions {
                 let session = ProviderSession {
+                    updated_at: info
+                        .updated_at
+                        .filter(|v| crate::model::activity_timestamp(v).is_some()),
+                    internal: info
+                        .meta
+                        .as_ref()
+                        .and_then(|m| m.get("tether"))
+                        .and_then(|m| m.get("internal"))
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false),
                     id: info.session_id.to_string(),
                     provider: self.id.clone(),
                     cwd: info.cwd.to_string_lossy().into(),
@@ -761,6 +779,11 @@ impl Provider for AcpProvider {
                 // Cwd is authoritative from the agent, even for known IDs.
                 entry.session.cwd = session.cwd;
                 entry.session.title = session.title;
+                entry.session.updated_at = crate::model::latest_activity(
+                    entry.session.updated_at.clone(),
+                    session.updated_at,
+                );
+                entry.session.internal = session.internal;
                 data.push(entry.session.clone());
             }
         }

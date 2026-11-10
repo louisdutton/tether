@@ -53,7 +53,7 @@ async fn catalog_merges_all_bindings_without_title_or_native_id_collisions() {
     );
     let mut ids: Vec<_> = page.data.into_iter().map(|s| s.id).collect();
     ids.sort();
-    let next: Vec<_> = f
+    let mut next: Vec<_> = f
         .manager
         .list(None)
         .await
@@ -62,10 +62,11 @@ async fn catalog_merges_all_bindings_without_title_or_native_id_collisions() {
         .into_iter()
         .map(|s| s.id)
         .collect();
+    next.sort();
     assert_eq!(ids, next);
     f.close().await;
     let manager = Fixture::connect(f.directory.path()).await;
-    let restored: Vec<_> = manager
+    let mut restored: Vec<_> = manager
         .list(None)
         .await
         .unwrap()
@@ -73,6 +74,7 @@ async fn catalog_merges_all_bindings_without_title_or_native_id_collisions() {
         .into_iter()
         .map(|s| s.id)
         .collect();
+    restored.sort();
     assert_eq!(ids, restored);
     manager.shutdown().await;
 }
@@ -329,4 +331,150 @@ async fn native_command_success_is_rejected_if_the_conversation_still_exists() {
             .exists()
     );
     f.close().await;
+}
+
+fn metadata(f: &Fixture, agent: &str, id: &str, updated_at: Option<&str>, internal: bool) {
+    let path = f.directory.path().join(agent).join(format!("{id}.json"));
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    value["updatedAt"] = serde_json::json!(updated_at);
+    value["_meta"] = serde_json::json!({"tether":{"internal":internal}});
+    value["title"] = "Guardian review".into();
+    std::fs::write(path, serde_json::to_vec(&value).unwrap()).unwrap();
+}
+
+#[tokio::test]
+async fn internal_metadata_hides_existing_cached_guardians_without_deleting_originals_or_similarly_named_chats()
+ {
+    let f = Fixture::new().await;
+    for id in ["guardian", "real-chat"] {
+        seed(&f, "codex", id, f.directory.path());
+    }
+    let original = f.manager.list(None).await.unwrap();
+    assert_eq!(original.data.len(), 2);
+    metadata(&f, "codex", "guardian", Some("2026-11-10T10:00:00Z"), true);
+    metadata(
+        &f,
+        "codex",
+        "real-chat",
+        Some("2026-11-10T09:00:00Z"),
+        false,
+    );
+    let page = f.manager.list(None).await.unwrap();
+    assert_eq!(page.data.len(), 1);
+    assert_eq!(page.data[0].binding().session_id, "real-chat");
+    assert_eq!(page.data[0].title.as_deref(), Some("Guardian review"));
+    assert!(f.directory.path().join("codex/guardian.json").exists());
+    assert!(f.directory.path().join("codex/guardian.history").exists());
+    // Persist the classification even if the provider is unavailable after restart.
+    std::fs::write(f.directory.path().join("codex/fail-list"), "").unwrap();
+    f.close().await;
+    let manager = Fixture::connect(f.directory.path()).await;
+    let page = manager.list(None).await.unwrap();
+    assert_eq!(page.data.len(), 1);
+    assert!(!page.failures.is_empty());
+    manager.shutdown().await;
+}
+
+#[tokio::test]
+async fn catalog_preserves_provider_recency_and_does_not_bump_history_reads_or_refreshes() {
+    let f = Fixture::new().await;
+    for (agent, id, time) in [
+        ("codex", "older", "2026-11-10T10:00:00+01:00"),
+        ("claude", "newest", "2026-11-10T09:01:00Z"),
+        ("codex", "unknown", "invalid"),
+    ] {
+        seed(&f, agent, id, f.directory.path());
+        metadata(&f, agent, id, Some(time), false);
+    }
+    let first = f.manager.list(None).await.unwrap();
+    assert_eq!(
+        first
+            .data
+            .iter()
+            .map(|s| s.binding().session_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["newest", "older", "unknown"]
+    );
+    let timestamp = first.data[0].updated_at.clone();
+    f.manager.history(&first.data[0].id).await.unwrap();
+    let same = f.manager.list(None).await.unwrap();
+    assert_eq!(timestamp, same.data[0].updated_at);
+    metadata(&f, "codex", "older", Some("2026-11-10T11:00:00Z"), false);
+    let refreshed = f.manager.list(None).await.unwrap();
+    assert_eq!(refreshed.data[0].binding().session_id, "older");
+    assert_eq!(refreshed.data[0].id, first.data[1].id);
+    let expected = refreshed
+        .data
+        .iter()
+        .map(|s| (s.id.clone(), s.updated_at.clone()))
+        .collect::<Vec<_>>();
+    f.close().await;
+    let manager = Fixture::connect(f.directory.path()).await;
+    assert_eq!(
+        manager
+            .list(None)
+            .await
+            .unwrap()
+            .data
+            .iter()
+            .map(|s| (s.id.clone(), s.updated_at.clone()))
+            .collect::<Vec<_>>(),
+        expected
+    );
+    manager.shutdown().await;
+}
+
+#[tokio::test]
+async fn recency_pages_use_persisted_snapshots_across_activity_insertion_deletion_and_restart() {
+    let f = Fixture::new().await;
+    for index in 0..61 {
+        let id = format!("native-{index:02}");
+        seed(&f, "codex", &id, f.directory.path());
+        metadata(&f, "codex", &id, Some("2026-11-10T09:00:00Z"), false);
+    }
+    let first = f.manager.list(None).await.unwrap();
+    assert_eq!(first.data.len(), 50);
+    let cursor = first.next_cursor.clone().unwrap();
+    let mut expected: Vec<_> = f
+        .manager
+        .list(Some(cursor.clone()))
+        .await
+        .unwrap()
+        .data
+        .into_iter()
+        .map(|s| s.id)
+        .collect();
+    // One unseen row becomes newest, one is deleted, and a new row arrives.
+    let remaining = f.manager.get(&expected[0]).await.unwrap();
+    metadata(
+        &f,
+        "codex",
+        &remaining.binding().session_id,
+        Some("2026-11-10T12:00:00Z"),
+        false,
+    );
+    f.manager.delete(&expected[1]).await.unwrap();
+    expected.remove(1);
+    seed(&f, "codex", "inserted", f.directory.path());
+    metadata(&f, "codex", "inserted", Some("2026-11-10T13:00:00Z"), false);
+    let refreshed = f.manager.list(None).await.unwrap();
+    assert_eq!(refreshed.data[0].binding().session_id, "inserted");
+    assert_eq!(refreshed.data[1].id, remaining.id);
+    f.close().await;
+    let manager = Fixture::connect(f.directory.path()).await;
+    let rest = manager.list(Some(cursor.clone())).await.unwrap();
+    assert_eq!(
+        rest.data.into_iter().map(|s| s.id).collect::<Vec<_>>(),
+        expected
+    );
+    assert!(rest.next_cursor.is_none());
+    assert!(
+        manager
+            .list_filtered(Some(cursor), Some(f.directory.path()))
+            .await
+            .is_err()
+    );
+    assert!(manager.list(Some("v2:invalid:1".into())).await.is_err());
+    manager.shutdown().await;
 }

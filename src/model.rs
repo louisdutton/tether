@@ -3,6 +3,10 @@ use serde_json::Value;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ProviderSession {
+    #[serde(default)]
+    pub updated_at: Option<String>,
+    #[serde(default)]
+    pub internal: bool,
     pub id: String,
     pub provider: String,
     pub cwd: String,
@@ -89,6 +93,10 @@ pub struct Binding {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Session {
+    #[serde(default)]
+    pub updated_at: Option<String>,
+    #[serde(default)]
+    pub internal: bool,
     #[serde(default)]
     pub deletion_pending: bool,
     #[serde(default)]
@@ -177,7 +185,7 @@ pub struct AgentChange {
     pub after_sequence: i64,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CatalogFailure {
     pub provider: String,
     pub message: String,
@@ -186,5 +194,32 @@ pub struct CatalogFailure {
 pub struct CatalogPage {
     pub data: Vec<Session>,
     pub next_cursor: Option<String>,
+    pub failures: Vec<CatalogFailure>,
+}
+
+/// Compare actual instants, including provider timestamps with differing offsets.
+pub fn activity_timestamp(value: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|v| v.timestamp_millis())
+}
+pub fn latest_activity(a: Option<String>, b: Option<String>) -> Option<String> {
+    let a = a.filter(|v| activity_timestamp(v).is_some());
+    let b = b.filter(|v| activity_timestamp(v).is_some());
+    if b.as_deref().and_then(activity_timestamp) > a.as_deref().and_then(activity_timestamp) {
+        b
+    } else {
+        a
+    }
+}
+pub fn activity_now() -> String {
+    chrono::DateTime::<chrono::Utc>::from(std::time::SystemTime::now())
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct CatalogSnapshot {
+    pub ids: Vec<String>,
+    pub cwd: Option<String>,
     pub failures: Vec<CatalogFailure>,
 }
