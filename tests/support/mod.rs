@@ -22,6 +22,9 @@ pub fn scripts() -> &'static TempDir {
         let path = dir.path().join("acp");
         std::fs::write(&path, include_str!("../fixtures/acp")).unwrap();
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let delete = dir.path().join("delete");
+        std::fs::write(&delete, include_str!("../fixtures/delete")).unwrap();
+        std::fs::set_permissions(delete, std::fs::Permissions::from_mode(0o700)).unwrap();
         dir
     })
 }
@@ -30,6 +33,11 @@ pub fn command(directory: &Path, id: &str) -> AgentCommand {
         id: id.into(),
         command: scripts().path().join("acp"),
         args: vec![id.into(), directory.join(id).to_string_lossy().into()],
+        permanent_delete: Some(tether::providers::acp::DeleteCommand {
+            command: Some(scripts().path().join("delete")),
+            method: None,
+            args: vec![directory.join(id).to_string_lossy().into()],
+        }),
     }
 }
 pub struct Fixture {

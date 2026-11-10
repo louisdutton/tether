@@ -1046,7 +1046,7 @@ async fn delete_succeeds_when_the_workspace_has_moved() {
 }
 
 #[tokio::test]
-async fn delete_is_available_offline_and_removes_authored_inputs_and_turns() {
+async fn delete_fails_offline_and_retains_the_visible_session_and_history() {
     let f = Fixture::new().await;
     let session = f.create("codex", tether::model::SessionKind::Managed).await;
     f.send(&session.id, None, "hello").await;
@@ -1066,22 +1066,34 @@ async fn delete_is_available_offline_and_removes_authored_inputs_and_turns() {
     .unwrap();
     let (peer, stop, task) = connected(&f).await;
     peer.initialize().await;
-    peer.cx
+    let error = peer
+        .cx
         .send_request(DeleteSessionRequest::new(session.id.clone()))
         .block_task()
         .await
+        .unwrap_err();
+    assert_eq!(error.code.value(), -32003);
+    let list = peer
+        .cx
+        .send_request(ListSessionsRequest::new())
+        .block_task()
+        .await
         .unwrap();
-    peer.close().await;
-    stop.cancel();
-    let _ = task.await;
-    f.close().await;
-    let db = rusqlite::Connection::open(f.directory.path().join("state/sessions.sqlite3")).unwrap();
-    for table in ["sessions", "inputs", "turns"] {
-        let count: i64 = db
-            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(count, 0, "{table} retains deleted data");
-    }
+    assert!(
+        list.sessions
+            .iter()
+            .any(|s| s.session_id.to_string() == session.id)
+    );
+    assert!(serde_json::to_value(&list).unwrap()["_meta"]["tether"]["catalogComplete"] == false);
+    assert!(!f.manager.history(&session.id).await.unwrap().is_empty());
+    assert!(
+        f.directory
+            .path()
+            .join("codex")
+            .join(format!("{}.json", session.binding().session_id))
+            .exists()
+    );
+    close(f, peer, stop, task).await;
 }
 
 #[tokio::test]

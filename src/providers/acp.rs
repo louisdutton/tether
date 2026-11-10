@@ -38,6 +38,18 @@ pub struct AgentCommand {
     pub command: PathBuf,
     #[serde(default)]
     pub args: Vec<String>,
+    #[serde(default, rename = "permanentDelete")]
+    pub permanent_delete: Option<DeleteCommand>,
+}
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeleteCommand {
+    #[serde(default)]
+    pub command: Option<PathBuf>,
+    #[serde(default)]
+    pub method: Option<String>,
+    #[serde(default)]
+    pub args: Vec<String>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct Record {
@@ -203,6 +215,7 @@ fn raw_item(index: usize, update: SessionUpdate) -> Result<Item> {
 
 pub struct AcpProvider {
     id: String,
+    permanent_delete: Option<DeleteCommand>,
     cx: ConnectionTo<Agent>,
     capabilities: AgentCapabilities,
     shared: Arc<Shared>,
@@ -228,6 +241,24 @@ impl AcpProvider {
                     .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
             "agent id must contain letters, digits, '-' or '_'"
         );
+        if let Some(delete) = &config.permanent_delete {
+            ensure!(
+                delete.command.is_some() != delete.method.is_some(),
+                "configure exactly one permanentDelete command or method"
+            );
+            if let Some(command) = &delete.command {
+                ensure!(
+                    command.is_absolute(),
+                    "permanentDelete.command must be absolute"
+                );
+            }
+            if let Some(method) = &delete.method {
+                ensure!(
+                    method.starts_with('_') && delete.args.is_empty(),
+                    "permanentDelete.method must be an explicit ACP extension without command args"
+                );
+            }
+        }
         use std::os::unix::fs::PermissionsExt;
         if !directory.exists() {
             if let Some(parent) = directory.parent().filter(|p| !p.as_os_str().is_empty())
@@ -350,6 +381,7 @@ impl AcpProvider {
         shared.ready.store(true, Ordering::Release);
         Ok(Self {
             id: config.id,
+            permanent_delete: config.permanent_delete,
             cx,
             capabilities: response.agent_capabilities,
             shared,
@@ -467,6 +499,84 @@ impl AcpProvider {
 }
 #[async_trait]
 impl Provider for AcpProvider {
+    fn supports_delete(&self) -> bool {
+        self.permanent_delete.is_some() && self.supports_close()
+    }
+    async fn delete(&self, id: &str) -> Result<()> {
+        let delete = self
+            .permanent_delete
+            .as_ref()
+            .context("no permanent deletion command configured")?;
+        ensure!(self.ready(), "agent is unavailable");
+        let record = self.record(id)?;
+        ensure!(
+            record.current.is_none(),
+            "cannot delete an active native conversation"
+        );
+        if record.loaded {
+            self.close(id).await?;
+        }
+        // Standard ACP deletion can mean archive. Only explicitly configured
+        // permanent deletion operations are eligible here.
+        if let Some(method) = &delete.method {
+            self.request(method, json!({"sessionId": id})).await?;
+        } else {
+            let mut child = Command::new(
+                delete
+                    .command
+                    .as_ref()
+                    .context("missing deletion command")?,
+            )
+            .args(&delete.args)
+            .arg("--")
+            .arg(id)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .process_group(0)
+            .spawn()
+            .context("starting permanent deletion command")?;
+            let _group = ProcessGroup(child.id().context("missing deletion command PID")? as i32);
+            let status = tokio::time::timeout(Duration::from_secs(30), child.wait())
+                .await
+                .context("permanent deletion command timed out; outcome is unknown")??;
+            ensure!(
+                status.success(),
+                "permanent deletion command failed ({status})"
+            );
+        }
+        // Verify against the provider's fresh catalog, not the local record cache.
+        // Codex's supplied adapter includes archived histories in this catalog.
+        let mut cursor = None;
+        let mut seen = std::collections::HashSet::new();
+        loop {
+            let page = self
+                .list(cursor)
+                .await
+                .context("verifying permanent deletion")?;
+            ensure!(
+                !page.data.iter().any(|session| session.id == id),
+                "native conversation still exists after deletion"
+            );
+            cursor = page.next_cursor;
+            if cursor.is_none() {
+                break;
+            }
+            ensure!(
+                seen.insert(cursor.clone()),
+                "native deletion verification returned a repeated cursor"
+            );
+        }
+        self.shared.records.lock().unwrap().remove(id);
+        self.shared
+            .pending
+            .lock()
+            .unwrap()
+            .retain(|update| update.session_id.to_string() != id);
+        self.shared.save()?;
+        Ok(())
+    }
     fn supports_close(&self) -> bool {
         self.capabilities.session_capabilities.close.is_some() && self.capabilities.load_session
     }
@@ -561,6 +671,7 @@ impl Provider for AcpProvider {
     }
     fn capabilities(&self) -> Capabilities {
         Capabilities {
+            delete: self.supports_delete(),
             resume: self.capabilities.load_session,
             list: self.capabilities.session_capabilities.list.is_some(),
             history: self.capabilities.load_session,

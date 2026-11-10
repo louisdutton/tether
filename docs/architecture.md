@@ -62,7 +62,9 @@ with unknown delivery; it is never retried automatically.
 A private per-agent JSON record stores native session directories, MCP settings
 and explicit config selections needed to load native conversations. Managed
 transcripts live in SQLite. Direct sessions use ACP's native load replay as their
-history; adoption/import retain the Tether identity. Native discovery depends on
+history; adoption/import retain the Tether identity. Standard session/list refreshes
+all configured agents, records unseen bindings without loading them, and reuses
+existing binding owners. Discovery depends on
 the agent advertising `session/list`; returning to a native conversation requires
 `loadSession` support.
 
@@ -103,3 +105,18 @@ Tether binds to loopback by default and has no application authentication.
 Access control belongs to the deployment's trusted network, tunnel or reverse
 proxy. Provider authentication belongs to the configured agent and its native
 runtime. The data directory is private; SQLite uses an exclusive connection lock.
+
+## Permanent deletion
+
+Deletion preflights every binding, persists a pending marker, and deletes native
+originals before removing SQLite history. Each completed binding is saved so a
+partial failure remains visible and retryable after restart. Pending conversations
+cannot execute or import, preventing resurrection. A successful native operation
+must also pass a fresh catalog absence check. Native record caches are removed
+only after verification; the shared transcript is removed in one final transaction.
+
+Providers opt into an explicit permanent ACP extension or a native command;
+standard ACP session/delete is not trusted to guarantee erasure. The packaged
+Codex integration patches its upstream adapter to use supported thread/delete,
+and includes archived threads in discovery. Upstream patch anchors are checked
+at build time. Unsupported providers return errors and retain their records.

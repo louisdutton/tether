@@ -47,6 +47,9 @@ fn mapped(error: manager::Error) -> Error {
     match error {
         manager::Error::Invalid(message) => Error::invalid_params().data(message),
         manager::Error::NotFound => Error::new(-32002, "Session or turn not found"),
+        manager::Error::Deletion(message) => {
+            Error::new(-32003, "Permanent deletion failed").data(message)
+        }
         manager::Error::Busy => Error::new(-32001, "Session already has an active turn"),
         manager::Error::Provider(error) if error.downcast_ref::<Error>().is_some() => {
             error.downcast::<Error>().expect("checked ACP error type")
@@ -70,7 +73,7 @@ struct Options {
     kind: Option<model::SessionKind>,
 }
 fn metadata(session: &model::Session) -> Meta {
-    [ ("tether".into(), json!({"provider":session.provider,"kind":session.kind,"machineId":session.machine_id,"status":session.status})) ].into_iter().collect()
+    [ ("tether".into(), json!({"provider":session.provider,"kind":session.kind,"machineId":session.machine_id,"status":session.status,"bindings":session.bindings,"deletionPending":session.deletion_pending,"deletionError":session.deletion_error})) ].into_iter().collect()
 }
 fn attached(manager: &Manager, state: &Mutex<State>, id: &str) -> Result<()> {
     if state.lock().unwrap().attached.get(id).copied() != Some(manager.session_epoch(id)) {
@@ -391,22 +394,22 @@ async fn handle_request(
             if request.cwd.as_ref().is_some_and(|p| !p.is_absolute()) {
                 return Err(Error::invalid_params().data("cwd must be absolute"));
             }
-            let page = manager.list(request.cursor).await.map_err(mapped)?;
+            let page = manager
+                .list_filtered(request.cursor, request.cwd.as_deref())
+                .await
+                .map_err(mapped)?;
             let sessions = page
                 .data
                 .into_iter()
-                .filter(|s| {
-                    request.cwd.as_ref().is_none_or(|cwd| {
-                        cwd.canonicalize().ok() == std::path::Path::new(&s.cwd).canonicalize().ok()
-                    })
-                })
                 .map(|s| {
                     SessionInfo::new(s.id.clone(), &s.cwd)
                         .title(s.title.clone())
                         .meta(metadata(&s))
                 })
                 .collect();
-            value(ListSessionsResponse::new(sessions).next_cursor(page.next_cursor))
+            value(ListSessionsResponse::new(sessions).next_cursor(page.next_cursor).meta(
+                [("tether".into(), json!({"catalogComplete":page.failures.is_empty(),"catalogErrors":page.failures}))].into_iter().collect::<Meta>()
+            ))
         }
         "session/set_config_option" => {
             let request: SetSessionConfigOptionRequest = params(payload)?;
@@ -427,20 +430,6 @@ async fn handle_request(
             }
             let request: Id = params(payload)?;
             value(manager.import(&request.session_id).await.map_err(mapped)?)
-        }
-        "_tether/providers/sessions" => {
-            #[derive(serde::Deserialize)]
-            struct Discovery {
-                provider: String,
-                cursor: Option<String>,
-            }
-            let request: Discovery = params(payload)?;
-            value(
-                manager
-                    .discover(&request.provider, request.cursor)
-                    .await
-                    .map_err(mapped)?,
-            )
         }
         "_tether/session/adopt" => {
             #[derive(serde::Deserialize)]

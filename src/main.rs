@@ -54,12 +54,14 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(|_| "codex-acp".into())
                 .into(),
             args: vec![],
+            permanent_delete: None,
         }];
         if let Ok(binary) = env::var("TETHER_CLAUDE_ACP_BIN") {
             agents.push(AgentCommand {
                 id: "claude".into(),
                 command: binary.into(),
                 args: vec![],
+                permanent_delete: None,
             });
         }
         agents

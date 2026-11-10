@@ -22,6 +22,7 @@
         in
         {
           inherit tether;
+          codex-acp = pkgs.callPackage ./nix/codex-acp.nix { };
           default = tether;
         }
       );

@@ -12,6 +12,8 @@ use tokio::sync::broadcast;
 // Only operations needed by the pilot; wire formats stay inside each adapter.
 #[async_trait]
 pub trait Provider: Send + Sync {
+    fn supports_delete(&self) -> bool;
+    async fn delete(&self, id: &str) -> Result<()>;
     fn supports_close(&self) -> bool;
     async fn close(&self, id: &str) -> Result<Vec<Turn>>;
     async fn modes(&self, id: &str) -> Result<Option<SessionModeState>>;

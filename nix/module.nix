@@ -11,7 +11,7 @@ let
     if lib.hasInfix ":" cfg.listenAddress then "[${cfg.listenAddress}]" else cfg.listenAddress;
   agentCommands = lib.mapAttrsToList (id: agent: {
     inherit id;
-    inherit (agent) command args;
+    inherit (agent) command args permanentDelete;
   }) cfg.agents;
 in
 {
@@ -63,6 +63,31 @@ in
               type = absolutePath;
               example = "/run/current-system/sw/bin/codex-acp";
               description = "Absolute path to the ACP agent executable.";
+            };
+            permanentDelete = lib.mkOption {
+              default = null;
+              description = "Explicit permanent-deletion operation. Configure either an ACP extension method or a native command; failures retain Tether records.";
+              type = lib.types.nullOr (
+                lib.types.submodule {
+                  options = {
+                    command = lib.mkOption {
+                      type = lib.types.nullOr absolutePath;
+                      default = null;
+                      description = "Absolute executable path for verified permanent deletion.";
+                    };
+                    method = lib.mkOption {
+                      type = lib.types.nullOr (lib.types.strMatching "_.*");
+                      default = null;
+                      description = "Explicit ACP extension that permanently deletes the bound native session.";
+                    };
+                    args = lib.mkOption {
+                      type = lib.types.listOf lib.types.str;
+                      default = [ ];
+                      description = "Fixed arguments preceding -- and the bound native session ID.";
+                    };
+                  };
+                }
+              );
             };
             args = lib.mkOption {
               type = lib.types.listOf lib.types.str;
@@ -126,6 +151,17 @@ in
           builtins.attrNames cfg.agents
         );
         message = "services.tether.agents IDs must contain only letters, digits, '-' or '_'.";
+      }
+      {
+        assertion = lib.all (
+          agent:
+          agent.permanentDelete == null
+          || (
+            (agent.permanentDelete.command != null) != (agent.permanentDelete.method != null)
+            && (agent.permanentDelete.method == null || agent.permanentDelete.args == [ ])
+          )
+        ) (builtins.attrValues cfg.agents);
+        message = "services.tether.agents permanentDelete requires exactly one command or method; method does not accept args.";
       }
     ];
 

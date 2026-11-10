@@ -26,10 +26,10 @@ external; provider login happens through the installed agent/native runtime.
 | --- | --- |
 | `initialize` | Negotiate v1 and advertised capabilities |
 | `session/new` | Create a managed conversation with the default available agent |
-| `session/list` | List Tether conversations with optional cwd/cursor filtering |
+| `session/list` | Authoritative catalog across all configured agents, with optional cwd/cursor filtering |
 | `session/load` | Attach and replay shared history before responding |
 | `session/resume` | Attach without replaying conversation history |
-| `session/delete` | Remove Tether-owned session/history; repeated or unknown IDs succeed |
+| `session/delete` | Permanently delete all bound native conversations and histories, then Tether records; failures remain visible |
 | `session/close` | Cancel work and release native sessions when all adapters advertise close and load |
 | `session/set_mode` | Select an adapter-advertised mode; modes are returned on new/load/resume |
 | `session/set_config_option` | Select the agent or change an advertised native setting |
@@ -47,6 +47,27 @@ objects pass through to the ACP agent unchanged.
 Additional workspace roots, system-prompt overrides and client-provided
 filesystem/terminal services are not exposed. Interactive permission requests
 receive ACP's cancelled outcome; there is no approval UI.
+
+## Authoritative session catalog
+
+`session/list` refreshes every configured agent and drains its native pagination
+before applying the requested cwd filter and public pagination. Conversations
+inside the configured workspace root appear automatically; discovering one does
+not load it or execute a prompt. Use the returned public ID for load, resume,
+close, import and delete. IDs persist across refreshes and process restarts.
+
+Deduplication uses actual `(configured agent ID, native session ID)` bindings.
+All bindings of a managed cross-agent conversation resolve to its existing public
+ID, including inactive bindings. Similar titles or directories are not evidence
+of identity. Adoption reuses an existing catalog ID instead of duplicating it.
+
+`_meta.tether.catalogComplete` indicates whether every agent refreshed successfully;
+`catalogErrors` identifies unavailable/unsupported catalogs. Cached conversations
+remain visible during failures. Cursors are opaque. The supplied Codex adapter
+includes active and archived conversations, every model provider and every native
+source kind. Other adapters must expose their complete native catalog to provide
+the same coverage. The former `_tether/providers/sessions` discovery route is
+removed; clients use standard `session/list`.
 
 ## Standard configuration
 
@@ -144,7 +165,6 @@ operational diagnostics:
 | Extension method | Parameters | Behavior |
 | --- | --- | --- |
 | `_tether/providers` | `{}` | Agent IDs, readiness and inferred adapter capabilities |
-| `_tether/providers/sessions` | `{provider,cursor?}` | Native discovery through the agent's `session/list`, filtered to workspace root |
 | `_tether/session/adopt` | `{provider,providerSessionId,kind?}` | Bind an existing native conversation; load it before prompting |
 | `_tether/session/import` | `{sessionId}` | Convert direct ownership to managed history, retaining identity |
 
@@ -154,7 +174,7 @@ removed; use standard config options instead.
 
 Initialize advertises these extensions under `agentCapabilities._meta.tether`.
 New/load/list responses include provider, ownership kind, machine ID and runtime
-status under `_meta.tether`. Agent changes also use `session_info_update`.
+status, native bindings, deletionPending and deletionError under `_meta.tether`. Agent changes also use `session_info_update`.
 Clients advertising `clientCapabilities._meta.tether` receive `_tether/event`
 notifications for operational details such as provider unavailability and
 `resync.required`. Standard session metadata/config updates require no opt-in.
@@ -162,7 +182,7 @@ Extension responses retain internal snake_case fields; they are not standard ACP
 session objects.
 
 Unknown methods return `-32601`, invalid parameters `-32602`, missing
-sessions/turns `-32002`, busy sessions `-32001` and storage/agent failures
+sessions/turns `-32002`, busy sessions `-32001` permanent deletion failures `-32003`, and storage/agent failures
 `-32603`. Native ACP errors retain their code, message and data, including prompt failures and authentication errors.
 
 References: [ACP v1](https://agentclientprotocol.com/protocol/v1/overview),
@@ -172,12 +192,28 @@ References: [ACP v1](https://agentclientprotocol.com/protocol/v1/overview),
 
 ## Session cleanup and capability scope
 
-Delete removes Tether's conversation, bindings, authored inputs and transcript in
-one transaction. An active conversation returns `-32001`; cancel it first.
-Deletion remains available when its provider is offline or its cwd has moved.
-The original adapter-owned conversations are retained and may be explicitly
-adopted again as a new Tether identity. Deleted IDs cannot be loaded or resumed.
-Deletion invalidates attachments on all connected clients.
+Delete requires an explicitly configured permanent-deletion operation for every
+native binding. It removes the original provider conversation and history, verifies
+its absence from the fresh native catalog, and only then removes Tether's bindings,
+authored inputs and transcript. Archiving, hiding and deleting only local records
+never count as successful deletion. An active conversation returns `-32001`;
+cancel it first. Unknown/already-deleted public IDs succeed idempotently.
+
+Unsupported deletion, offline providers, native failures and failed verification
+return an error (`-32003` for deletion failures). The session remains in
+`session/list` with `_meta.tether.deletionError`. Once destructive work starts,
+`deletionPending` remains set until completion; load/resume/prompt cannot recreate
+a partially deleted conversation. Its retained Tether history remains readable.
+Successfully deleted bindings are durably marked, so retry after restart only
+deletes the remaining originals. Tether's transcript is removed only when every
+binding succeeds. Successful deletion invalidates all client attachments.
+
+The packaged Codex adapter exposes `_tether/session/delete_permanently`, calling
+the supported native app-server `thread/delete` operation on its own connection.
+Stock codex-acp 1.13.1 maps `session/delete` to `thread/archive` and is insufficient.
+Codex also provides `codex delete --force`, but that CLI can fail while an adapter
+still owns the loaded thread; the packaged integration uses the same-server API.
+No filesystem deletion or SQLite modification of Codex storage is used.
 
 Close retains the conversation and history. It forwards `session/close` to every
 native binding, waits for active prompts to settle, and invalidates attachments.
@@ -192,3 +228,5 @@ including older stored updates: relative adapter paths use the session cwd.
 
 See [ACP v1 coverage](acp-conformance.md) for the audited method surface,
 capability boundaries, tests and remaining optional features.
+
+Native API reference: [Codex app-server](https://learn.chatgpt.com/docs/app-server).

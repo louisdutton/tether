@@ -26,7 +26,10 @@ Add the input and module to your existing system configuration:
             enable = true;
             user = "louis";
             workspaceRoot = "/home/louis/projects";
-            agents.codex.command = lib.getExe pkgs.codex-acp;
+            agents.codex = {
+              command = lib.getExe tether.packages.${pkgs.stdenv.hostPlatform.system}.codex-acp;
+              permanentDelete.method = "_tether/session/delete_permanently";
+            };
           };
         })
       ];
@@ -78,6 +81,26 @@ letters, digits, hyphens and underscores. At least one agent must be configured.
 Bash, coreutils and Git are available on the service PATH; add workspace-specific
 tools through `extraPackages`.
 
+## Native catalogs and permanent deletion
+
+`packages.<system>.codex-acp` is a version-checked patch of the nixpkgs adapter.
+It enumerates active and archived threads across all model providers and source
+kinds, reopens archived threads for load/resume, and exposes the supported native
+`thread/delete` API through `_tether/session/delete_permanently`. Use it together
+with the `permanentDelete.method` configuration in the complete example above.
+The adapter uses the same Codex home, credentials and runtime as ordinary sessions.
+
+Deletion is disabled per agent unless `permanentDelete` is configured. The stock
+Codex ACP adapter archives on session/delete; configuring that call as permanent
+deletion is incorrect. An alternative integration may configure an absolute
+`permanentDelete.command` and fixed `args`; Tether appends `--` and the exact bound
+native session ID without invoking a shell. Configure exactly one command or ACP
+extension method, and ensure its documented behavior permanently removes native
+history. Both operation success and fresh-catalog absence are required. Every
+binding of a cross-agent session must support deletion, or the request fails and
+the conversation stays visible. Do not use Codex's external delete CLI for loaded
+adapter sessions; the packaged same-server API handles that case.
+
 ## State, networking and environment
 
 The service creates `/var/lib/tether` with mode `0700`, owned by its configured
@@ -125,6 +148,7 @@ cancelled outcome; there is no approval UI.
 
 - `nixosModules.default` and `nixosModules.tether`: the same NixOS module.
 - `packages.<system>.default` and `packages.<system>.tether`: the Rust package.
+- `packages.<system>.codex-acp`: complete Codex catalog and permanent deletion integration.
 - `apps.<system>.default`: run Tether with `nix run` and the usual environment.
 - `overlays.default`: optionally add `pkgs.tether` to another package set.
 - `checks.<system>.package`: package build and Rust integration tests.

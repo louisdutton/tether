@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+set -eu
+state=$1
+shift
+[ "$1" = -- ]
+shift
+id=$1
+case "$id" in */*|..|.) exit 8;; esac
+printf '%s\n' "$id" >> "$state/delete-requests"
+[ ! -f "$state/fail-delete" ] || exit 7
+[ -f "$state/$id.json" ] || exit 4
+[ ! -f "$state/noop-delete" ] || exit 0
+rm -f -- "$state/$id.json" "$state/$id.history"

@@ -36,12 +36,14 @@ while IFS= read -r line; do
       reply "$(jq -cn --arg sid "$sid" --argjson config "$(config)" '{sessionId:$sid,configOptions:$config,modes:{currentModeId:"ask",availableModes:[{id:"ask",name:"Ask"},{id:"code",name:"Code"}]}}')"
       ;;
     session/list)
-      sessions='[]'
-      for file in "$state/$agent-"*.json; do
-        [ -e "$file" ] || continue
-        sessions=$(jq --argjson item "$(jq '{sessionId,cwd,title:"Fixture session"}' "$file")" '. + [$item]' <<< "$sessions")
-      done
-      reply "$(jq -cn --argjson sessions "$sessions" '{sessions:$sessions}')"
+      if [ -f "$state/fail-list" ]; then error 'native catalog unavailable'; continue; fi
+      shopt -s nullglob
+      files=("$state/"*.json)
+      sessions=$(jq -s '[.[] | select(has("sessionId") and has("cwd")) | {sessionId,cwd,title:(.title // "Fixture session")}]' "${files[@]}" </dev/null)
+      if [ -f "$state/duplicate-list" ]; then sessions=$(jq '. + .' <<< "$sessions"); fi
+      offset=$(jq -r '.params.cursor // "0"' <<< "$line")
+      size=$(cat "$state/page-size" 2>/dev/null || printf 10000)
+      reply "$(jq -cn --argjson sessions "$sessions" --argjson offset "$offset" --argjson size "$size" '{sessions:$sessions[$offset:($offset+$size)]} + (if ($offset+$size)<($sessions|length) then {nextCursor:(($offset+$size)|tostring)} else {} end)')"
       ;;
     session/load)
       if [ ! -f "$state/$sid.json" ]; then error 'unknown session'; continue; fi

@@ -18,7 +18,9 @@ retaining one session identity and transcript.
 - Persistent managed history, including original prompt content, readable when
   an agent is unavailable.
 - Separate native session bindings and bounded text handover between agents.
-- Native discovery, direct session adoption and managed import where supported.
+- One binding-deduplicated session catalog across configured agents, with stable IDs for native and managed conversations.
+- Verified permanent native deletion; unsupported or failed deletion returns an error and keeps the session visible.
+- Direct session adoption and managed import where supported.
 
 This build serves one user on one execution machine. It has no frontend, relay,
 pairing, multi-machine routing, delegation engine or worktree manager. Local

@@ -83,10 +83,16 @@ pub struct Binding {
     pub provider: String,
     pub session_id: String,
     pub replay_through: i64,
+    #[serde(default)]
+    pub deleted: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Session {
+    #[serde(default)]
+    pub deletion_pending: bool,
+    #[serde(default)]
+    pub deletion_error: Option<String>,
     #[serde(default, skip_serializing)]
     pub mcp_servers: Vec<agent_client_protocol::v1::schema::McpServer>,
     pub id: String,
@@ -150,6 +156,7 @@ pub struct ProviderInfo {
 
 #[derive(Clone, Copy, Debug, Serialize)]
 pub struct Capabilities {
+    pub delete: bool,
     pub resume: bool,
     pub list: bool,
     pub history: bool,
@@ -168,4 +175,16 @@ pub struct AgentChange {
     pub from: String,
     pub to: String,
     pub after_sequence: i64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct CatalogFailure {
+    pub provider: String,
+    pub message: String,
+}
+#[derive(Clone, Debug, Serialize)]
+pub struct CatalogPage {
+    pub data: Vec<Session>,
+    pub next_cursor: Option<String>,
+    pub failures: Vec<CatalogFailure>,
 }

@@ -5,5 +5,5 @@ tck_state=$(mktemp -d /tmp/tether-acp-tck-state.XXXXXX)
 export TETHER_WORKSPACE_ROOT=/tmp
 export TETHER_DATA_DIR="$tck_state"
 export TETHER_AGENTS
-TETHER_AGENTS=$(jq -cn --arg fixture "$fixture_root/tests/fixtures/acp" --arg state "$tck_state" '["codex","claude"] | map({id:.,command:$fixture,args:[.,($state + "/" + .)]})')
+TETHER_AGENTS=$(jq -cn --arg fixture "$fixture_root/tests/fixtures/acp" --arg state "$tck_state" '["codex","claude"] | map({id:.,command:$fixture,args:[.,($state + "/" + .)],permanentDelete:{command:($fixture | sub("/acp$";"/delete")),args:[($state + "/" + .)]}})')
 exec "$fixture_root/target/debug/tether" --stdio

@@ -187,16 +187,16 @@ async fn switches_keep_identity_and_replay_only_away_context() {
 async fn direct_import_and_adoption_preserve_ownership() {
     let f = Fixture::new().await;
     let s = f.create("codex", SessionKind::Direct).await;
-    assert!(
-        f.manager
-            .adopt(AdoptSession {
-                provider: "codex".into(),
-                provider_session_id: s.bindings[0].session_id.clone(),
-                kind: SessionKind::Managed
-            })
-            .await
-            .is_err()
-    );
+    let adopted = f
+        .manager
+        .adopt(AdoptSession {
+            provider: "codex".into(),
+            provider_session_id: s.bindings[0].session_id.clone(),
+            kind: SessionKind::Direct,
+        })
+        .await
+        .unwrap();
+    assert_eq!(adopted.id, s.id);
     assert!(
         f.manager
             .message(
@@ -292,7 +292,8 @@ async fn missing_provider_executable_fails_startup() {
             AgentCommand {
                 id: "missing".into(),
                 command: "/does/not/exist".into(),
-                args: vec![]
+                args: vec![],
+                permanent_delete: None,
             },
             dir.path()
         )

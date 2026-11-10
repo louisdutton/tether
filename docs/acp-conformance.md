@@ -11,8 +11,8 @@ all optional methods or v2/unstable extensions.
 | initialize | Negotiates v1, reports implementation, capabilities and empty auth methods; required before session operations |
 | authenticate | No methods advertised: provider login happens on the execution host; unsupported method IDs return invalid params |
 | new / prompt / cancel | Implemented using SDK types, rich content, structured updates and standard stop reasons; cancellation settles the prompt |
-| list / load | Implemented for Tether-owned IDs; cwd filtering, pagination, metadata and managed history replay; offline history remains readable |
-| delete | Advertised; transactional Tether history removal, idempotent missing IDs, busy rejection, available offline; native histories remain separately owned |
+| list / load | One binding-deduplicated catalog across all configured agents, stable public IDs, cwd filtering and pagination; managed history replay remains readable offline |
+| delete | Explicit permanent native deletion and verification for every binding before transactional Tether history removal; unsupported/offline/failed deletion errors and remains visible |
 | resume | Advertised; same cwd/MCP checks as load, attaches without historical replay, unavailable execution returns an error |
 | close | Advertised only when all adapters support native close and load; cancels work, preserves history and requires reattachment |
 | set_mode | Available when the active adapter returns modes; new/load/resume include its mode state and changes emit current_mode_update |
@@ -46,6 +46,26 @@ close/cancel/reattach, capability gating, mode selection, native errors, and
 absolute live/replayed tool paths. The existing suite covers rich content,
 configuration persistence, agent switching and offline history.
 
+Catalog regression tests cover multiple agents, inactive managed bindings,
+native pagination, cwd filtering before public pagination, stable IDs across
+restart and incomplete refreshes. Deletion tests cover unsupported operations,
+partial failure and restart/retry, retained history, and a zero-exit command that
+fails to remove the native conversation. `node tests/codex-catalog.mjs
+nix/codex-catalog.js` checks all-source/all-provider active and archived traversal.
+The version-checked package patch fails when the upstream integration changes.
+Run `python3 tests/codex-native-proof.py --codex /absolute/bin/codex
+--adapter /absolute/bin/patched-codex-acp --tether /absolute/bin/tether` for the
+optional real-runtime check. It creates a new isolated CODEX_HOME and workspace,
+and deletes only the disposable conversations it creates there.
+
+A disposable real Codex 0.160.0 / codex-acp 1.13.1 check on 2026-11-10 created
+three persisted histories, archived two, restarted Tether to verify stable catalog
+IDs, exercised archived load/close/resume/close, and permanently deleted all
+three through ACP. Both the public catalog and original rollout files were empty
+afterward. Its model endpoint was an unreachable loopback port; no inference or
+existing user conversation was involved. This validates the packaged native
+`thread/delete` route, not the stock adapter's archive-based deletion.
+
 The official [ACP Test Compatibility Kit](https://github.com/agentclientprotocol/acp-tck)
 is an independent additional check, not a full or certified conformance guarantee.
 Use its v1 suite with `--cancel-prompt slow` and `tests/fixtures/tck-agent` after
@@ -57,7 +77,7 @@ Nix-provided interpreter to uv on NixOS. For example, with the TCK checked out a
 mkdir -p /tmp/acp-tck-workspace
 devenv shell -- uv run --python /absolute/path/to/python3 --project /tmp/acp-tck acp-tck \
   --agent-cwd /tmp/acp-tck-workspace --cancel-prompt slow \
-  --report-json /tmp/tether-acp-report.json -- ./tests/fixtures/tck-agent
+  --report-json /tmp/tether-acp-report.json -- /absolute/path/to/tether/tests/fixtures/tck-agent
 ```
 
 The fixture adapters exercise protocol behavior without credentials or model

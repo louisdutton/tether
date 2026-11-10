@@ -17,6 +17,7 @@ pub enum Error {
     Invalid(String),
     NotFound,
     Busy,
+    Deletion(String),
     Provider(anyhow::Error),
     Storage(anyhow::Error),
 }
@@ -195,7 +196,7 @@ impl Manager {
     }
     pub async fn set_mode(&self, id: &str, mode: SessionModeId) -> Result<()> {
         let _guard = self.commands.lock().await;
-        let session = self.stored(id)?;
+        let session = self.executable(id)?;
         let provider = self.provider(&session.provider)?;
         if self.native(&session).await?.status != "running" {
             provider
@@ -209,19 +210,49 @@ impl Manager {
     }
     pub async fn delete(&self, id: &str) -> Result<()> {
         let _guard = self.commands.lock().await;
-        let Some(session) = self.db(|db| db.get(id))? else {
+        let Some(mut session) = self.db(|db| db.get(id))? else {
             return Ok(());
         };
-        // Cleanup remains possible after a workspace moves or its provider goes
-        // offline. Do not resume or execute the native session just to delete it.
-        if let Some(provider) = self.providers.get(&session.provider)
-            && provider.ready()
-            && provider
-                .get(&session.binding().session_id)
+        for binding in session.bindings.iter().filter(|b| !b.deleted) {
+            let problem = match self.providers.get(&binding.provider) {
+                None => Some("agent is not configured".to_string()),
+                Some(provider) if !provider.supports_delete() => {
+                    Some("permanent deletion is unsupported".into())
+                }
+                Some(provider) if !provider.ready() => Some("agent is unavailable".into()),
+                Some(provider) => match provider.get(&binding.session_id).await {
+                    Ok(native) if native.status == "running" => return Err(Error::Busy),
+                    Ok(_) => None,
+                    Err(error) => Some(format!("cannot verify native conversation: {error}")),
+                },
+            };
+            if let Some(problem) = problem {
+                let message = format!("{}: {problem}", binding.provider);
+                session.deletion_error = Some(message.clone());
+                self.db(|db| db.save(&session))?;
+                return Err(Error::Deletion(message));
+            }
+        }
+        session.deletion_pending = true;
+        session.deletion_error = None;
+        self.db(|db| db.save(&session))?;
+        for index in 0..session.bindings.len() {
+            let binding = &session.bindings[index];
+            if binding.deleted {
+                continue;
+            }
+            if let Err(error) = self
+                .provider(&binding.provider)?
+                .delete(&binding.session_id)
                 .await
-                .is_ok_and(|native| native.status == "running")
-        {
-            return Err(Error::Busy);
+            {
+                let message = format!("{}: {error}", binding.provider);
+                session.deletion_error = Some(message.clone());
+                self.db(|db| db.save(&session))?;
+                return Err(Error::Deletion(message));
+            }
+            session.bindings[index].deleted = true;
+            self.db(|db| db.save(&session))?;
         }
         self.db(|db| db.delete(id))?;
         self.detached(id, "session.deleted");
@@ -307,7 +338,7 @@ impl Manager {
         value: SessionConfigOptionValue,
     ) -> Result<Vec<SessionConfigOption>> {
         let _guard = self.commands.lock().await;
-        let mut session = self.stored(id)?;
+        let mut session = self.executable(id)?;
         if key == "tether.agent" {
             let target = value
                 .as_value_id()
@@ -338,14 +369,24 @@ impl Manager {
         self.events.subscribe()
     }
     fn allowed(&self, cwd: &str) -> bool {
-        Path::new(cwd)
-            .canonicalize()
-            .is_ok_and(|p| p.is_dir() && p.starts_with(&self.root))
+        Path::new(cwd).is_absolute()
+            && Path::new(cwd)
+                .canonicalize()
+                .is_ok_and(|p| p.is_dir() && p.starts_with(&self.root))
     }
     fn stored(&self, id: &str) -> Result<Session> {
         let session = self.db(|db| db.get(id))?.ok_or(Error::NotFound)?;
         if !self.allowed(&session.cwd) {
             return Err(Error::NotFound);
+        }
+        Ok(session)
+    }
+    fn executable(&self, id: &str) -> Result<Session> {
+        let session = self.stored(id)?;
+        if session.deletion_pending {
+            return Err(Error::Deletion(
+                "permanent deletion is incomplete; retry delete before continuing".into(),
+            ));
         }
         Ok(session)
     }
@@ -390,6 +431,8 @@ impl Manager {
             ));
         }
         let session = Session {
+            deletion_pending: false,
+            deletion_error: None,
             mcp_servers,
             id: Uuid::new_v4().to_string(),
             kind,
@@ -402,6 +445,7 @@ impl Manager {
                 provider: native.provider,
                 session_id: native.id,
                 replay_through: 0,
+                deleted: false,
             }],
             agent_changes: vec![],
             pending_context: None,
@@ -449,7 +493,23 @@ impl Manager {
         } else {
             None
         };
-        let session = self.record(native, request.kind, &turns.unwrap_or_default(), vec![])?;
+        let session =
+            if let Some(mut existing) = self.db(|db| db.owner(&native.provider, &native.id))? {
+                if existing.deletion_pending {
+                    return Err(Error::Deletion(
+                        "conversation deletion is incomplete".into(),
+                    ));
+                }
+                if request.kind == SessionKind::Managed && existing.kind == SessionKind::Direct {
+                    existing.kind = SessionKind::Managed;
+                    self.db(|db| {
+                        db.save_with_history(&existing, turns.as_deref().unwrap_or_default())
+                    })?;
+                }
+                existing
+            } else {
+                self.record(native, request.kind, &turns.unwrap_or_default(), vec![])?
+            };
         if request.kind == SessionKind::Managed {
             provider.managed(&session.binding().session_id).await?;
         }
@@ -457,7 +517,7 @@ impl Manager {
     }
     pub async fn import(&self, id: &str) -> Result<Session> {
         let _guard = self.commands.lock().await;
-        let mut session = self.stored(id)?;
+        let mut session = self.executable(id)?;
         if session.kind == SessionKind::Managed {
             return Ok(session);
         }
@@ -481,30 +541,124 @@ impl Manager {
         page.data.retain(|s| self.allowed(&s.cwd));
         Ok(page)
     }
-    pub async fn list(&self, cursor: Option<String>) -> Result<Page<Session>> {
+    pub async fn list(&self, cursor: Option<String>) -> Result<CatalogPage> {
+        self.list_filtered(cursor, None).await
+    }
+    pub async fn list_filtered(
+        &self,
+        cursor: Option<String>,
+        cwd: Option<&Path>,
+    ) -> Result<CatalogPage> {
         let after = cursor
             .as_deref()
-            .map(str::parse::<usize>)
-            .transpose()
-            .map_err(|_| Error::Invalid("invalid cursor".into()))?
-            .unwrap_or(0);
-        let sessions: Vec<_> = self
+            .map(|cursor| {
+                let id = cursor
+                    .strip_prefix("v1:")
+                    .ok_or_else(|| Error::Invalid("invalid catalog cursor".into()))?;
+                Uuid::parse_str(id).map_err(|_| Error::Invalid("invalid catalog cursor".into()))?;
+                Ok::<_, Error>(id)
+            })
+            .transpose()?;
+        let _guard = self.commands.lock().await;
+        let mut failures = vec![];
+        for (id, provider) in &self.providers {
+            if !provider.ready() || !provider.capabilities().list {
+                failures.push(CatalogFailure {
+                    provider: id.clone(),
+                    message:
+                        "native catalog is unavailable or unsupported; showing cached conversations"
+                            .into(),
+                });
+                continue;
+            }
+            let mut cursor = None;
+            let mut seen = std::collections::HashSet::new();
+            let mut discovered = vec![];
+            loop {
+                match provider.list(cursor.clone()).await {
+                    Ok(page) => {
+                        discovered.extend(page.data);
+                        match page.next_cursor {
+                            None => break,
+                            Some(next) if seen.insert(next.clone()) => cursor = Some(next),
+                            Some(_) => {
+                                failures.push(CatalogFailure {
+                                    provider: id.clone(),
+                                    message: "agent returned a repeated catalog cursor".into(),
+                                });
+                                break;
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            provider = id,
+                            ?error,
+                            "native session catalog refresh failed"
+                        );
+                        failures.push(CatalogFailure {
+                            provider: id.clone(),
+                            message: "native catalog refresh failed; showing cached conversations"
+                                .into(),
+                        });
+                        break;
+                    }
+                }
+            }
+            for native in discovered {
+                if native.provider != *id || !self.allowed(&native.cwd) {
+                    continue;
+                }
+                if let Some(mut session) = self.db(|db| db.owner(id, &native.id))? {
+                    if session.provider == *id && !session.deletion_pending {
+                        session.title = native.title.clone().or(session.title);
+                        self.db(|db| db.save(&session))?;
+                    }
+                    continue;
+                }
+                self.record(native, SessionKind::Direct, &[], vec![])?;
+            }
+        }
+        let mut sessions: Vec<_> = self
             .db(|db| db.sessions())?
             .into_iter()
-            .filter(|s| self.allowed(&s.cwd))
+            .filter(|s| self.allowed(&s.cwd) || s.deletion_pending || s.deletion_error.is_some())
+            .filter(|s| {
+                cwd.is_none_or(|cwd| {
+                    cwd.canonicalize()
+                        .ok()
+                        .is_some_and(|path| Path::new(&s.cwd).canonicalize().ok() == Some(path))
+                })
+            })
+            .filter(|s| after.is_none_or(|after| s.id.as_str() > after))
             .collect();
-        let next = after.saturating_add(50);
-        let mut data = Vec::new();
-        for session in sessions.iter().skip(after).take(50) {
-            data.push(self.get(&session.id).await?);
+        sessions.sort_by(|a, b| a.id.cmp(&b.id));
+        let more = sessions.len() > 50;
+        sessions.truncate(50);
+        let next_cursor = more.then(|| format!("v1:{}", sessions.last().unwrap().id));
+        let mut data = vec![];
+        for mut session in sessions {
+            if session.deletion_pending {
+                session.status = "deletion_failed".into();
+            } else if !self.allowed(&session.cwd) {
+                session.status = "unavailable".into();
+            } else {
+                session = self.get(&session.id).await?;
+            }
+            data.push(session);
         }
-        Ok(Page {
+        Ok(CatalogPage {
             data,
-            next_cursor: (next < sessions.len()).then(|| next.to_string()),
+            next_cursor,
+            failures,
         })
     }
     pub async fn get(&self, id: &str) -> Result<Session> {
         let mut session = self.stored(id)?;
+        if session.deletion_pending {
+            session.status = "deletion_failed".into();
+            return Ok(session);
+        }
         session.status = match self.providers.get(&session.provider) {
             Some(provider) if provider.ready() => match self.native(&session).await {
                 Ok(native) => {
@@ -531,6 +685,9 @@ impl Manager {
     pub async fn history(&self, id: &str) -> Result<Vec<TranscriptTurn>> {
         let _guard = self.commands.lock().await;
         let session = self.stored(id)?;
+        if session.deletion_pending {
+            return self.db(|db| db.history(id));
+        }
         if session.kind == SessionKind::Managed {
             if let Some(provider) = self.providers.get(&session.provider).filter(|p| p.ready())
                 && self.native(&session).await.is_ok()
@@ -569,7 +726,7 @@ impl Manager {
         mcp_servers: Vec<agent_client_protocol::v1::schema::McpServer>,
     ) -> Result<Session> {
         let _guard = self.commands.lock().await;
-        let mut session = self.stored(id)?;
+        let mut session = self.executable(id)?;
         if !cwd.is_absolute()
             || cwd.canonicalize().ok() != Path::new(&session.cwd).canonicalize().ok()
         {
@@ -602,7 +759,7 @@ impl Manager {
 
     pub async fn resume(&self, id: &str) -> Result<Session> {
         let _guard = self.commands.lock().await;
-        let mut session = self.stored(id)?;
+        let mut session = self.executable(id)?;
         let b = session.binding();
         let provider = self.provider(&b.provider)?;
         if self.native(&session).await?.status == "running" {
@@ -688,6 +845,7 @@ impl Manager {
                     provider: target.into(),
                     session_id: native.id,
                     replay_through: 0,
+                    deleted: false,
                 },
                 0,
             )
@@ -755,7 +913,7 @@ impl Manager {
             return Err(Error::Invalid("text must not be empty".into()));
         }
         let _guard = self.commands.lock().await;
-        let mut session = self.stored(id)?;
+        let mut session = self.executable(id)?;
         if let Some(target) = &request.provider
             && target != &session.provider
         {
@@ -867,7 +1025,7 @@ impl Manager {
         let Some(mut session) = self.db(|db| db.owner(provider, &native))? else {
             return Ok(());
         };
-        if session.provider != provider || !self.allowed(&session.cwd) {
+        if session.deletion_pending || session.provider != provider || !self.allowed(&session.cwd) {
             return Ok(());
         }
         event.session_id = Some(session.id.clone());

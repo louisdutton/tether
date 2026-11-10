@@ -27,7 +27,7 @@ rustPlatform.buildRustPackage {
   ];
 
   postPatch = ''
-    patchShebangs tests/fixtures/acp
+    patchShebangs tests/fixtures
   '';
 
   meta = {
