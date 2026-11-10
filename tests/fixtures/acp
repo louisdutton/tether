@@ -11,7 +11,12 @@ config() {
   effort=$(jq -r '.effort // "low"' "$state/$sid.json")
   jq -cn --arg model "$model" --arg effort "$effort" '[{id:"model",name:"Model",category:"model",type:"select",currentValue:$model,options:[{value:"small",name:"Small"},{value:"large",name:"Large"}]},{id:"effort",name:"Reasoning",category:"thought_level",type:"select",currentValue:$effort,options:[{value:"low",name:"Low"},{value:"high",name:"High"}]}]'
 }
+modes() {
+  mode=$(jq -r '.mode // "ask"' "$state/$sid.json")
+  jq -cn --arg mode "$mode" '{currentModeId:$mode,availableModes:[{id:"ask",name:"Ask"},{id:"code",name:"Code"}]}'
+}
 pending=''
+
 while IFS= read -r line; do
   printf '%s\n' "$line" >> "$state/requests.jsonl"
   request_id=$(jq -c '.id // null' <<< "$line")
@@ -19,7 +24,8 @@ while IFS= read -r line; do
   sid=$(jq -r '.params.sessionId // ""' <<< "$line")
   case "$method" in
     initialize)
-      reply '{"protocolVersion":1,"agentCapabilities":{"loadSession":true,"promptCapabilities":{"image":true,"embeddedContext":true},"sessionCapabilities":{"list":{}}}}'
+      if [ -f "$state/no-close" ]; then close='{}'; else close='{"close":{}}'; fi
+      reply "$(jq -cn --argjson close "$close" '{protocolVersion:1,agentCapabilities:{loadSession:true,promptCapabilities:{image:true,embeddedContext:true},sessionCapabilities:({list:{}} + $close)}}')"
       ;;
     session/new)
       count=$(cat "$state/counter" 2>/dev/null || printf 0)
@@ -27,7 +33,7 @@ while IFS= read -r line; do
       sid="$agent-$count"
       jq --arg sid "$sid" '.params + {sessionId:$sid}' <<< "$line" > "$state/$sid.json"
       update '{"sessionUpdate":"available_commands_update","availableCommands":[{"name":"compact","description":"Compact conversation"}]}'
-      reply "$(jq -cn --arg sid "$sid" --argjson config "$(config)" '{sessionId:$sid,configOptions:$config}')"
+      reply "$(jq -cn --arg sid "$sid" --argjson config "$(config)" '{sessionId:$sid,configOptions:$config,modes:{currentModeId:"ask",availableModes:[{id:"ask",name:"Ask"},{id:"code",name:"Code"}]}}')"
       ;;
     session/list)
       sessions='[]'
@@ -42,7 +48,22 @@ while IFS= read -r line; do
       if [ -f "$state/$sid.history" ]; then
         while IFS= read -r item; do update "$item"; done < "$state/$sid.history"
       fi
-      reply "$(jq -cn --argjson config "$(config)" '{configOptions:$config}')"
+      reply "$(jq -cn --argjson config "$(config)" --argjson modes "$(modes)" '{configOptions:$config,modes:$modes}')"
+      ;;
+    session/close)
+      close_id=$request_id
+      if [ -n "$pending" ] && [ "$sid" = "$pending_sid" ]; then
+        request_id=$pending; pending=''; reply '{"stopReason":"cancelled"}'
+      fi
+      request_id=$close_id
+      reply '{}'
+      ;;
+    session/set_mode)
+      mode=$(jq -r '.params.modeId' <<< "$line")
+      if [ "$mode" != ask ] && [ "$mode" != code ]; then error 'invalid mode'; continue; fi
+      jq --arg mode "$mode" '.mode=$mode' "$state/$sid.json" > "$state/mode.tmp"
+      mv "$state/mode.tmp" "$state/$sid.json"
+      reply '{}'
       ;;
     session/set_config_option)
       key=$(jq -r '.params.configId' <<< "$line")
@@ -57,6 +78,10 @@ while IFS= read -r line; do
       ;;
     session/prompt)
       text=$(jq -r '[.params.prompt[] | select(.type == "text") | .text] | join("\n")' <<< "$line")
+      if [[ "$text" == *auth-error* ]]; then
+        jq -cn --argjson id "$request_id" '{jsonrpc:"2.0",id:$id,error:{code:-32000,message:"Authentication required",data:{provider:"fixture"}}}'
+        continue
+      fi
       if [[ "$text" == *crash* ]]; then exit 7; fi
       if [[ "$text" == *failure* ]]; then error 'fixture failed before completion'; continue; fi
       # Native user echoes intentionally contain the handover. Tether must retain
@@ -67,7 +92,7 @@ while IFS= read -r line; do
       if [[ "$text" == *slow* ]]; then pending=$request_id; pending_sid=$sid; continue; fi
       update '{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"thinking"}}'
       update '{"sessionUpdate":"plan","entries":[{"content":"Inspect repository","priority":"medium","status":"completed"}]}'
-      update '{"sessionUpdate":"tool_call","toolCallId":"tool-1","title":"Read file","kind":"read","status":"in_progress","rawInput":{"path":"README.md"}}'
+      update '{"sessionUpdate":"tool_call","toolCallId":"tool-1","title":"Read file","kind":"read","status":"in_progress","rawInput":{"path":"README.md"},"locations":[{"path":"README.md","line":1}]}'
       update '{"sessionUpdate":"tool_call_update","toolCallId":"tool-1","status":"completed","content":[{"type":"diff","path":"README.md","oldText":"a","newText":"b"}]}'
       assistant='{"sessionUpdate":"agent_message_chunk","messageId":"answer","content":{"type":"text","text":"hello"}}'
       update "$assistant"

@@ -239,7 +239,7 @@ async fn initialization_attachment_content_and_method_errors_are_explicit() {
         .block_task()
         .await
         .unwrap_err();
-    assert_eq!(unattached.code.value(), -32602);
+    assert_eq!(unattached.code.value(), -32002);
     assert!(
         peer.cx
             .send_request(NewSessionRequest::new("/"))
@@ -651,6 +651,12 @@ async fn acp_content_and_structured_updates_survive_transport_and_history() {
         serde_json::to_value(content).unwrap()
     );
     let live = peer.updates.lock().unwrap().clone();
+    let expected_path = f.directory.path().join("README.md");
+    assert!(
+        live.iter()
+            .any(|u| matches!(&u.update, SessionUpdate::ToolCall(c)
+        if c.locations.first().is_some_and(|location| location.path == expected_path)))
+    );
     assert!(
         live.iter()
             .any(|u| matches!(u.update, SessionUpdate::AgentThoughtChunk(_)))
@@ -668,6 +674,13 @@ async fn acp_content_and_structured_updates_survive_transport_and_history() {
         .await
         .unwrap();
     let replay = peer.updates.lock().unwrap().clone();
+    assert!(
+        replay
+            .iter()
+            .any(|u| matches!(&u.update, SessionUpdate::ToolCallUpdate(c)
+        if c.fields.content.as_ref().is_some_and(|content| content.iter().any(|content|
+            matches!(content, ToolCallContent::Diff(diff) if diff.path == expected_path)))))
+    );
     assert!(
         replay
             .iter()
@@ -742,4 +755,376 @@ async fn cached_history_loads_when_its_agent_is_removed_from_configuration() {
     stop.cancel();
     let _ = task.await;
     manager.shutdown().await;
+}
+
+#[tokio::test]
+async fn deletion_is_advertised_idempotent_and_persistent() {
+    let f = Fixture::new().await;
+    let (peer, stop, task) = connected(&f).await;
+    let init = peer.initialize().await;
+    assert!(
+        init.agent_capabilities
+            .session_capabilities
+            .delete
+            .is_some()
+    );
+    let id = peer.new_session(f.directory.path()).await;
+    peer.cx
+        .send_request(PromptRequest::new(id.clone(), vec!["hello".into()]))
+        .block_task()
+        .await
+        .unwrap();
+    for target in [id.clone(), id.clone(), SessionId::new("never-existed")] {
+        peer.cx
+            .send_request(DeleteSessionRequest::new(target))
+            .block_task()
+            .await
+            .unwrap();
+    }
+    assert!(
+        peer.cx
+            .send_request(ListSessionsRequest::new())
+            .block_task()
+            .await
+            .unwrap()
+            .sessions
+            .is_empty()
+    );
+    assert!(matches!(
+        f.manager.history(&id.to_string()).await,
+        Err(tether::manager::Error::NotFound)
+    ));
+    let missing = peer
+        .cx
+        .send_request(LoadSessionRequest::new(id.clone(), f.directory.path()))
+        .block_task()
+        .await
+        .unwrap_err();
+    assert_eq!(missing.code.value(), -32002);
+    peer.close().await;
+    stop.cancel();
+    let _ = task.await;
+    f.close().await;
+    let manager = Fixture::connect(f.directory.path()).await;
+    assert!(manager.list(None).await.unwrap().data.is_empty());
+    manager.shutdown().await;
+    assert!(
+        !f.requests("codex")
+            .iter()
+            .any(|r| r["method"] == "session/delete")
+    );
+}
+
+#[tokio::test]
+async fn resume_attaches_without_replaying_history_and_validates_cwd() {
+    let f = Fixture::new().await;
+    let session = f.create("codex", tether::model::SessionKind::Managed).await;
+    f.send(&session.id, None, "hello").await;
+    f.finished(&session.id, 1).await;
+    let (peer, stop, task) = connected(&f).await;
+    assert!(
+        peer.initialize()
+            .await
+            .agent_capabilities
+            .session_capabilities
+            .resume
+            .is_some()
+    );
+    let error = peer
+        .cx
+        .send_request(ResumeSessionRequest::new(session.id.clone(), "/"))
+        .block_task()
+        .await
+        .unwrap_err();
+    assert_eq!(error.code.value(), -32602);
+    peer.cx
+        .send_request(ResumeSessionRequest::new(
+            session.id.clone(),
+            f.directory.path(),
+        ))
+        .block_task()
+        .await
+        .unwrap();
+    assert!(!peer.updates.lock().unwrap().iter().any(|u| matches!(
+        u.update,
+        SessionUpdate::UserMessageChunk(_) | SessionUpdate::AgentMessageChunk(_)
+    )));
+    peer.cx
+        .send_request(PromptRequest::new(session.id, vec!["continue".into()]))
+        .block_task()
+        .await
+        .unwrap();
+    close(f, peer, stop, task).await;
+}
+
+#[tokio::test]
+async fn modes_are_returned_changed_and_reloaded_using_standard_methods() {
+    let f = Fixture::new().await;
+    let (peer, stop, task) = connected(&f).await;
+    peer.initialize().await;
+    let created = peer
+        .cx
+        .send_request(NewSessionRequest::new(f.directory.path()))
+        .block_task()
+        .await
+        .unwrap();
+    assert_eq!(created.modes.unwrap().current_mode_id.to_string(), "ask");
+    let id = created.session_id;
+    peer.cx
+        .send_request(SetSessionModeRequest::new(id.clone(), "code"))
+        .block_task()
+        .await
+        .unwrap();
+    let error = peer
+        .cx
+        .send_request(SetSessionModeRequest::new(id.clone(), "nonexistent"))
+        .block_task()
+        .await
+        .unwrap_err();
+    assert_eq!(error.code.value(), -32602);
+    let loaded = peer
+        .cx
+        .send_request(LoadSessionRequest::new(id, f.directory.path()))
+        .block_task()
+        .await
+        .unwrap();
+    assert_eq!(loaded.modes.unwrap().current_mode_id.to_string(), "code");
+    assert!(
+        f.requests("codex")
+            .iter()
+            .any(|r| r["method"] == "session/set_mode" && r["params"]["modeId"] == "code")
+    );
+    close(f, peer, stop, task).await;
+}
+
+#[tokio::test]
+async fn close_cancels_work_retains_history_and_requires_reattachment() {
+    let f = Fixture::new().await;
+    let (peer, stop, task) = connected(&f).await;
+    assert!(
+        peer.initialize()
+            .await
+            .agent_capabilities
+            .session_capabilities
+            .close
+            .is_some()
+    );
+    let id = peer.new_session(f.directory.path()).await;
+    let pending = tokio::spawn(
+        peer.cx
+            .send_request(PromptRequest::new(id.clone(), vec!["slow".into()]))
+            .block_task(),
+    );
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while f.manager.get(&id.to_string()).await.unwrap().status != "running" {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let busy = peer
+        .cx
+        .send_request(DeleteSessionRequest::new(id.clone()))
+        .block_task()
+        .await
+        .unwrap_err();
+    assert_eq!(busy.code.value(), -32001);
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        peer.cx
+            .send_request(CloseSessionRequest::new(id.clone()))
+            .block_task(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        pending.await.unwrap().unwrap().stop_reason,
+        StopReason::Cancelled
+    );
+    assert_eq!(
+        f.manager.get(&id.to_string()).await.unwrap().status,
+        "unloaded"
+    );
+    assert_eq!(f.manager.history(&id.to_string()).await.unwrap().len(), 1);
+    peer.cx
+        .send_request(CloseSessionRequest::new(id.clone()))
+        .block_task()
+        .await
+        .unwrap();
+    peer.cx
+        .send_request(CloseSessionRequest::new("never-existed"))
+        .block_task()
+        .await
+        .unwrap();
+    let detached = peer
+        .cx
+        .send_request(PromptRequest::new(id.clone(), vec!["hello".into()]))
+        .block_task()
+        .await
+        .unwrap_err();
+    assert_eq!(detached.code.value(), -32002);
+    peer.cx
+        .send_request(ResumeSessionRequest::new(id.clone(), f.directory.path()))
+        .block_task()
+        .await
+        .unwrap();
+    peer.cx
+        .send_request(PromptRequest::new(id, vec!["hello".into()]))
+        .block_task()
+        .await
+        .unwrap();
+    close(f, peer, stop, task).await;
+}
+
+#[tokio::test]
+async fn close_is_not_advertised_or_called_when_an_adapter_cannot_release_resources() {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(directory.path().join("codex")).unwrap();
+    std::fs::write(directory.path().join("codex/no-close"), "").unwrap();
+    let manager = Fixture::connect(directory.path()).await;
+    let f = Fixture { directory, manager };
+    let (peer, stop, task) = connected(&f).await;
+    assert!(
+        peer.initialize()
+            .await
+            .agent_capabilities
+            .session_capabilities
+            .close
+            .is_none()
+    );
+    let error = peer
+        .cx
+        .send_request(CloseSessionRequest::new("anything"))
+        .block_task()
+        .await
+        .unwrap_err();
+    assert_eq!(error.code.value(), -32601);
+    close(f, peer, stop, task).await;
+}
+
+#[tokio::test]
+async fn native_prompt_errors_retain_acp_codes_and_data() {
+    let f = Fixture::new().await;
+    let (peer, stop, task) = connected(&f).await;
+    peer.initialize().await;
+    let id = peer.new_session(f.directory.path()).await;
+    let error = peer
+        .cx
+        .send_request(PromptRequest::new(id, vec!["auth-error".into()]))
+        .block_task()
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.code,
+        agent_client_protocol::Error::auth_required().code
+    );
+    assert_eq!(error.data, Some(json!({"provider":"fixture"})));
+    close(f, peer, stop, task).await;
+}
+
+#[tokio::test]
+async fn delete_succeeds_when_the_workspace_has_moved() {
+    let f = Fixture::new().await;
+    let cwd = f.directory.path().join("project");
+    std::fs::create_dir(&cwd).unwrap();
+    let (peer, stop, task) = connected(&f).await;
+    peer.initialize().await;
+    let id = peer.new_session(&cwd).await;
+    std::fs::remove_dir(&cwd).unwrap();
+    peer.cx
+        .send_request(DeleteSessionRequest::new(id.clone()))
+        .block_task()
+        .await
+        .unwrap();
+    std::fs::create_dir(&cwd).unwrap();
+    assert!(matches!(
+        f.manager.get(&id.to_string()).await,
+        Err(tether::manager::Error::NotFound)
+    ));
+    close(f, peer, stop, task).await;
+}
+
+#[tokio::test]
+async fn delete_is_available_offline_and_removes_authored_inputs_and_turns() {
+    let f = Fixture::new().await;
+    let session = f.create("codex", tether::model::SessionKind::Managed).await;
+    f.send(&session.id, None, "hello").await;
+    f.finished(&session.id, 1).await;
+    f.send(&session.id, None, "crash").await;
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while f
+            .manager
+            .providers()
+            .iter()
+            .any(|p| p.id == "codex" && p.ready)
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let (peer, stop, task) = connected(&f).await;
+    peer.initialize().await;
+    peer.cx
+        .send_request(DeleteSessionRequest::new(session.id.clone()))
+        .block_task()
+        .await
+        .unwrap();
+    peer.close().await;
+    stop.cancel();
+    let _ = task.await;
+    f.close().await;
+    let db = rusqlite::Connection::open(f.directory.path().join("state/sessions.sqlite3")).unwrap();
+    for table in ["sessions", "inputs", "turns"] {
+        let count: i64 = db
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "{table} retains deleted data");
+    }
+}
+
+#[tokio::test]
+async fn closing_invalidates_other_clients_without_detaching_a_later_resume() {
+    let f = Fixture::new().await;
+    let (first, first_stop, first_task) = connected(&f).await;
+    let (second, second_stop, second_task) = connected(&f).await;
+    first.initialize().await;
+    second.initialize().await;
+    let id = first.new_session(f.directory.path()).await;
+    second
+        .cx
+        .send_request(ResumeSessionRequest::new(id.clone(), f.directory.path()))
+        .block_task()
+        .await
+        .unwrap();
+    first
+        .cx
+        .send_request(CloseSessionRequest::new(id.clone()))
+        .block_task()
+        .await
+        .unwrap();
+    first
+        .cx
+        .send_request(ResumeSessionRequest::new(id.clone(), f.directory.path()))
+        .block_task()
+        .await
+        .unwrap();
+    let detached = second
+        .cx
+        .send_request(PromptRequest::new(id.clone(), vec!["hello".into()]))
+        .block_task()
+        .await
+        .unwrap_err();
+    assert_eq!(detached.code.value(), -32002);
+    first
+        .cx
+        .send_request(PromptRequest::new(id, vec!["hello".into()]))
+        .block_task()
+        .await
+        .unwrap();
+    second.close().await;
+    second_stop.cancel();
+    let _ = second_task.await;
+    close(f, first, first_stop, first_task).await;
 }

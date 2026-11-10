@@ -45,6 +45,8 @@ struct Record {
     #[serde(default)]
     config: Vec<SessionConfigOption>,
     #[serde(default)]
+    modes: Option<SessionModeState>,
+    #[serde(default)]
     selected: BTreeMap<String, SessionConfigOptionValue>,
     #[serde(default)]
     mcp: Vec<McpServer>,
@@ -105,8 +107,14 @@ impl Shared {
             }
             return Ok(());
         };
-        let update = notification.update;
+        let mut update = notification.update;
+        super::absolute_update_paths(&mut update, Path::new(&record.session.cwd));
         match &update {
+            SessionUpdate::CurrentModeUpdate(mode) => {
+                if let Some(modes) = &mut record.modes {
+                    modes.current_mode_id = mode.current_mode_id.clone();
+                }
+            }
             SessionUpdate::ConfigOptionUpdate(config) => {
                 record.config = config.config_options.clone()
             }
@@ -413,6 +421,7 @@ impl AcpProvider {
             if let Ok(response) = &result {
                 let response: LoadSessionResponse = serde_json::from_value(response.clone())?;
                 entry.config = response.config_options.unwrap_or_default();
+                entry.modes = response.modes;
                 entry.loaded = true;
                 entry.mcp = mcp.to_vec();
                 entry.session.status = "idle".into();
@@ -458,6 +467,72 @@ impl AcpProvider {
 }
 #[async_trait]
 impl Provider for AcpProvider {
+    fn supports_close(&self) -> bool {
+        self.capabilities.session_capabilities.close.is_some() && self.capabilities.load_session
+    }
+    async fn close(&self, id: &str) -> Result<Vec<Turn>> {
+        let record = self.record(id)?;
+        if !record.loaded {
+            return Ok(vec![]);
+        }
+        self.request("session/close", json!({"sessionId":id}))
+            .await?;
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while self.record(id)?.current.is_some() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Ok::<_, anyhow::Error>(())
+        })
+        .await
+        .context("waiting for closed session's prompt to settle")??;
+        let turns = {
+            let mut records = self.shared.records.lock().unwrap();
+            let entry = records.get_mut(id).context("unknown ACP session")?;
+            entry.loaded = false;
+            entry.session.status = "unloaded".into();
+            entry.updates.clear();
+            entry.replay.clear();
+            std::mem::take(&mut entry.turns)
+        };
+        self.shared.save()?;
+        Ok(turns)
+    }
+    async fn modes(&self, id: &str) -> Result<Option<SessionModeState>> {
+        Ok(self.record(id)?.modes)
+    }
+    async fn set_mode(&self, id: &str, mode: SessionModeId) -> Result<()> {
+        let record = self.record(id)?;
+        let modes = record
+            .modes
+            .ok_or_else(agent_client_protocol::Error::method_not_found)?;
+        if !modes.available_modes.iter().any(|m| m.id == mode) {
+            return Err(agent_client_protocol::Error::invalid_params()
+                .data("unknown session mode")
+                .into());
+        }
+        self.request(
+            "session/set_mode",
+            serde_json::to_value(SetSessionModeRequest::new(id.to_owned(), mode.clone()))?,
+        )
+        .await?;
+        {
+            let mut records = self.shared.records.lock().unwrap();
+            let entry = records.get_mut(id).context("unknown ACP session")?;
+            if let Some(modes) = &mut entry.modes {
+                modes.current_mode_id = mode.clone();
+            }
+        }
+        self.shared.emit(
+            id,
+            None,
+            "acp.session_update",
+            serde_json::to_value(SessionUpdate::CurrentModeUpdate(CurrentModeUpdate::new(
+                mode,
+            )))?,
+        );
+        self.shared.save()?;
+        Ok(())
+    }
     fn id(&self) -> &str {
         &self.id
     }
@@ -517,6 +592,7 @@ impl Provider for AcpProvider {
             Record {
                 session: session.clone(),
                 config: result.config_options.unwrap_or_default(),
+                modes: result.modes,
                 selected: BTreeMap::new(),
                 mcp: request.mcp_servers,
                 direct: request.kind == SessionKind::Direct,
@@ -560,6 +636,7 @@ impl Provider for AcpProvider {
                 let entry = records.entry(session.id.clone()).or_insert_with(|| Record {
                     session: session.clone(),
                     config: vec![],
+                    modes: None,
                     selected: BTreeMap::new(),
                     mcp: vec![],
                     direct: true,
@@ -730,7 +807,7 @@ impl Provider for AcpProvider {
                         serde_json::to_value(response).unwrap(),
                     )
                 }
-                Err(error) => ("turn.failed", "failed", json!({"error":error.to_string()})),
+                Err(error) => ("turn.failed", "failed", json!({"error":error})),
             };
             {
                 let mut records = state.records.lock().unwrap();

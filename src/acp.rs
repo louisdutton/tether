@@ -19,7 +19,8 @@ type Result<T> = std::result::Result<T, Error>;
 struct State {
     initialized: bool,
     extensions: bool,
-    attached: HashSet<String>,
+    attached: HashMap<String, u64>,
+    cwd: HashMap<String, std::path::PathBuf>,
     active: HashMap<String, Arc<Active>>,
     owned_turns: HashSet<(String, String)>,
     output: Output,
@@ -47,11 +48,7 @@ fn mapped(error: manager::Error) -> Error {
         manager::Error::Invalid(message) => Error::invalid_params().data(message),
         manager::Error::NotFound => Error::new(-32002, "Session or turn not found"),
         manager::Error::Busy => Error::new(-32001, "Session already has an active turn"),
-        manager::Error::Provider(error)
-            if error
-                .downcast_ref::<Error>()
-                .is_some_and(|e| e.code.value() == -32602) =>
-        {
+        manager::Error::Provider(error) if error.downcast_ref::<Error>().is_some() => {
             error.downcast::<Error>().expect("checked ACP error type")
         }
         other => {
@@ -75,11 +72,12 @@ struct Options {
 fn metadata(session: &model::Session) -> Meta {
     [ ("tether".into(), json!({"provider":session.provider,"kind":session.kind,"machineId":session.machine_id,"status":session.status})) ].into_iter().collect()
 }
-fn attached(state: &Mutex<State>, id: &str) -> Result<()> {
-    if !state.lock().unwrap().attached.contains(id) {
-        return Err(
-            Error::invalid_params().data("load or create this session on the connection first")
-        );
+fn attached(manager: &Manager, state: &Mutex<State>, id: &str) -> Result<()> {
+    if state.lock().unwrap().attached.get(id).copied() != Some(manager.session_epoch(id)) {
+        return Err(Error::new(
+            -32002,
+            "Session is not attached; load or create it on this connection first",
+        ));
     }
     Ok(())
 }
@@ -120,7 +118,7 @@ pub async fn serve(
                     if !request_state.lock().unwrap().initialized { return Err(Error::invalid_request().data("initialize first")); }
                     let request: PromptRequest = params(payload)?;
                     let id = request.session_id.to_string();
-                    attached(&request_state, &id)?;
+                    attached(&request_manager, &request_state, &id)?;
                     let mut state = request_state.lock().unwrap();
                     if state.active.contains_key(&id) { return Err(mapped(manager::Error::Busy)); }
                     let active = Arc::new(Active::default());
@@ -149,7 +147,7 @@ pub async fn serve(
             if notification.method() == "session/cancel" {
                 let request: CancelNotification = params(notification.params().clone())?;
                 let id = request.session_id.to_string();
-                if attached(&notification_state, &id).is_ok() {
+                if attached(&notification_manager, &notification_state, &id).is_ok() {
                     let active = notification_state.lock().unwrap().active.get(&id).cloned();
                     if let Some(active) = active { active.cancel.cancel(); }
                     else if let Ok(turns) = notification_manager.history(&id).await
@@ -175,9 +173,21 @@ pub async fn serve(
                     }
                 };
                 let Some(id) = &event.session_id else { continue };
+                if matches!(event.kind.as_str(), "session.deleted" | "session.closed") {
+                    let mut state = state.lock().unwrap();
+                    // A delayed close event must not detach a newer resume/load.
+                    let epoch = event.data["epoch"].as_u64().unwrap_or(0);
+                    if state.attached.get(id).is_some_and(|attached| *attached >= epoch) { continue; }
+                    state.attached.remove(id);
+                    state.cwd.remove(id);
+                    state.output.clear_session(id);
+                    state.owned_turns.retain(|(session, _)| session != id);
+                    if let Some(active) = state.active.get(id) { active.cancel.cancel(); }
+                    continue;
+                }
                 let forward = {
                     let state = state.lock().unwrap();
-                    state.attached.contains(id) && !state.active.contains_key(id)
+                    state.attached.get(id).copied() == Some(manager.session_epoch(id)) && !state.active.contains_key(id)
                         && !event.turn_id.as_ref().is_some_and(|turn| state.owned_turns.contains(&(id.clone(), turn.clone())))
                 };
                 if forward { forward_event(&state, &cx, &event)?; }
@@ -205,7 +215,11 @@ async fn handle_request(
             .as_ref()
             .is_some_and(|m| m.get("tether").is_some());
         let capabilities = AgentCapabilities::new().load_session(true).prompt_capabilities(manager.prompt_capabilities()).mcp_capabilities(manager.mcp_capabilities())
-            .session_capabilities(SessionCapabilities::new().list(SessionListCapabilities::new()))
+            .session_capabilities(SessionCapabilities::new()
+                .list(SessionListCapabilities::new())
+                .delete(SessionDeleteCapabilities::new())
+                .resume(SessionResumeCapabilities::new())
+                .close(manager.supports_close().then(SessionCloseCapabilities::new)))
             .meta([("tether".into(), json!({"version":1,"providers":true,"managedHistory":true,"agentSwitching":true,"directSessions":true}))].into_iter().collect::<Meta>());
         return value(
             InitializeResponse::new(agent_client_protocol::schema::ProtocolVersion::V1)
@@ -235,12 +249,21 @@ async fn handle_request(
                 })
                 .await
                 .map_err(mapped)?;
-            state.lock().unwrap().attached.insert(session.id.clone());
+            {
+                let mut state = state.lock().unwrap();
+                state
+                    .attached
+                    .insert(session.id.clone(), manager.session_epoch(&session.id));
+                state
+                    .cwd
+                    .insert(session.id.clone(), session.cwd.clone().into());
+            }
             for update in manager.session_updates(&session.id).await.map_err(mapped)? {
                 notify(cx, &session.id, update)?;
             }
             value(
                 NewSessionResponse::new(session.id.clone())
+                    .modes(manager.modes(&session.id).await.map_err(mapped)?)
                     .config_options(manager.config(&session.id).await.map_err(mapped)?)
                     .meta(metadata(&session)),
             )
@@ -261,13 +284,21 @@ async fn handle_request(
                 .load(&id, &request.cwd, request.mcp_servers)
                 .await
                 .map_err(mapped)?;
-            state.lock().unwrap().attached.remove(&id);
+            {
+                let mut state = state.lock().unwrap();
+                state.attached.remove(&id);
+                state.cwd.insert(id.clone(), session.cwd.clone().into());
+            }
             let history = manager.history(&id).await.map_err(mapped)?;
             state.lock().unwrap().output.clear_session(&id);
             for turn in history {
                 replay(state, cx, &id, &turn)?;
             }
-            state.lock().unwrap().attached.insert(id.clone());
+            state
+                .lock()
+                .unwrap()
+                .attached
+                .insert(id.clone(), manager.session_epoch(&id));
             // Reconcile work that finished between the first snapshot and attachment.
             for turn in manager.history(&id).await.map_err(mapped)? {
                 replay(state, cx, &id, &turn)?;
@@ -277,9 +308,83 @@ async fn handle_request(
             }
             value(
                 LoadSessionResponse::new()
+                    .modes(manager.modes(&session.id).await.map_err(mapped)?)
                     .config_options(manager.config(&session.id).await.map_err(mapped)?)
                     .meta(metadata(&session)),
             )
+        }
+        "authenticate" => {
+            let _: AuthenticateRequest = params(payload)?;
+            Err(Error::invalid_params().data("no authentication methods are advertised; authenticate the provider on the execution host"))
+        }
+        "session/resume" => {
+            let request: ResumeSessionRequest = params(payload)?;
+            setup(
+                &request.cwd,
+                &request.additional_directories,
+                request.system_prompt.is_some(),
+                &request.mcp_servers,
+            )?;
+            let id = request.session_id.to_string();
+            let session = manager
+                .load(&id, &request.cwd, request.mcp_servers)
+                .await
+                .map_err(mapped)?;
+            if session.status == "unavailable" {
+                return Err(
+                    Error::internal_error().data("provider unavailable; cannot resume execution")
+                );
+            }
+            {
+                let mut state = state.lock().unwrap();
+                state
+                    .attached
+                    .insert(id.clone(), manager.session_epoch(&id));
+                state.cwd.insert(id, session.cwd.clone().into());
+            }
+            value(
+                ResumeSessionResponse::new()
+                    .modes(manager.modes(&session.id).await.map_err(mapped)?)
+                    .config_options(manager.config(&session.id).await.map_err(mapped)?)
+                    .meta(metadata(&session)),
+            )
+        }
+        "session/delete" => {
+            let request: DeleteSessionRequest = params(payload)?;
+            let id = request.session_id.to_string();
+            if state.lock().unwrap().active.contains_key(&id) {
+                return Err(mapped(manager::Error::Busy));
+            }
+            manager.delete(&id).await.map_err(mapped)?;
+            let mut state = state.lock().unwrap();
+            state.attached.remove(&id);
+            state.output.clear_session(&id);
+            value(DeleteSessionResponse::new())
+        }
+        "session/close" => {
+            if !manager.supports_close() {
+                return Err(Error::method_not_found());
+            }
+            let request: CloseSessionRequest = params(payload)?;
+            let id = request.session_id.to_string();
+            manager.close(&id).await.map_err(mapped)?;
+            let mut state = state.lock().unwrap();
+            state.attached.remove(&id);
+            state.output.clear_session(&id);
+            if let Some(active) = state.active.get(&id) {
+                active.cancel.cancel();
+            }
+            value(CloseSessionResponse::new())
+        }
+        "session/set_mode" => {
+            let request: SetSessionModeRequest = params(payload)?;
+            let id = request.session_id.to_string();
+            attached(manager, state, &id)?;
+            manager
+                .set_mode(&id, request.mode_id)
+                .await
+                .map_err(mapped)?;
+            value(SetSessionModeResponse::new())
         }
         "session/list" => {
             let request: ListSessionsRequest = params(payload)?;
@@ -306,7 +411,7 @@ async fn handle_request(
         "session/set_config_option" => {
             let request: SetSessionConfigOptionRequest = params(payload)?;
             let id = request.session_id.to_string();
-            attached(state, &id)?;
+            attached(manager, state, &id)?;
             let options = manager
                 .set_config(&id, &request.config_id.to_string(), request.value)
                 .await
@@ -462,6 +567,11 @@ async fn prompt(
                 return value(PromptResponse::new(StopReason::Cancelled));
             }
             "turn.failed" => {
+                if let Some(error) = event.data.get("error")
+                    && let Ok(error) = serde_json::from_value::<Error>(error.clone())
+                {
+                    return Err(error);
+                }
                 return Err(Error::internal_error()
                     .data(json!({"message":"agent turn failed","sessionId":id,"turnId":turn})));
             }
@@ -540,7 +650,11 @@ fn forward_event(
                     update[field] = Value::String(format!("{turn}/{native}"));
                 }
             }
-            notify(cx, id, params(update)?)?;
+            let mut update: SessionUpdate = params(update)?;
+            if let Some(cwd) = state.cwd.get(id) {
+                crate::providers::absolute_update_paths(&mut update, cwd);
+            }
+            notify(cx, id, update)?;
         }
         "acp.session_update" => notify(cx, id, params(event.data.clone())?)?,
         "session.agent_changed" => {

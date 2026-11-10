@@ -100,6 +100,15 @@ impl Store {
         Ok(())
     }
 
+    pub fn delete(&self, id: &str) -> Result<()> {
+        self.transaction(|db| {
+            db.0.execute("DELETE FROM inputs WHERE session_id=?1", [id])?;
+            db.0.execute("DELETE FROM turns WHERE session_id=?1", [id])?;
+            db.0.execute("DELETE FROM sessions WHERE id=?1", [id])?;
+            Ok(())
+        })
+    }
+
     pub fn get(&self, id: &str) -> Result<Option<Session>> {
         self.0
             .query_row("SELECT body FROM sessions WHERE id=?1", [id], |r| {

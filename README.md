@@ -9,7 +9,7 @@ retaining one session identity and transcript.
 
 ## What it does
 
-- Standard ACP session creation, listing, loading, prompts and cancellation.
+- Standard ACP session creation, listing, loading, resume, deletion, prompts and cancellation; native close when supported.
 - Standard configuration selectors for the active agent, models, reasoning and
   other settings advertised by the agent.
 - ACP message, reasoning, plan, tool, diff and command updates, with rich prompt
@@ -124,5 +124,5 @@ application side and deterministic ACP agent subprocesses on the other side,
 including real WebSocket and executable stdio connections. Live Codex/Claude
 adapter execution still needs a credentialed smoke test.
 
-See [API](docs/api.md), [architecture](docs/architecture.md) and
+See [ACP v1 coverage](docs/acp-conformance.md), [API](docs/api.md), [architecture](docs/architecture.md) and
 [interop references](docs/interop.md).

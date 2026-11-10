@@ -1,7 +1,7 @@
 pub mod acp;
 use agent_client_protocol::v1::schema::{
     ContentBlock, McpCapabilities, PromptCapabilities, SessionConfigOption,
-    SessionConfigOptionValue, SessionUpdate,
+    SessionConfigOptionValue, SessionModeId, SessionModeState, SessionUpdate,
 };
 
 use crate::model::{Capabilities, CreateSession, Event, Page, ProviderSession, StartedTurn, Turn};
@@ -12,6 +12,10 @@ use tokio::sync::broadcast;
 // Only operations needed by the pilot; wire formats stay inside each adapter.
 #[async_trait]
 pub trait Provider: Send + Sync {
+    fn supports_close(&self) -> bool;
+    async fn close(&self, id: &str) -> Result<Vec<Turn>>;
+    async fn modes(&self, id: &str) -> Result<Option<SessionModeState>>;
+    async fn set_mode(&self, id: &str, mode: SessionModeId) -> Result<()>;
     async fn session_updates(&self, id: &str) -> Result<Vec<SessionUpdate>>;
     fn id(&self) -> &str;
     fn mcp_capabilities(&self) -> McpCapabilities;
@@ -40,6 +44,39 @@ pub trait Provider: Send + Sync {
     ) -> Result<ProviderSession>;
     async fn interrupt(&self, id: &str, turn: &str) -> Result<()>;
     async fn shutdown(&self);
+}
+
+// Paths in ACP tool output are absolute even when an adapter reports them
+// relative to its session. Leave opaque raw input/output and metadata untouched.
+pub(crate) fn absolute_update_paths(update: &mut SessionUpdate, cwd: &std::path::Path) {
+    use agent_client_protocol::v1::schema::{ToolCallContent, ToolCallLocation};
+    fn paths(
+        content: &mut [ToolCallContent],
+        locations: &mut [ToolCallLocation],
+        cwd: &std::path::Path,
+    ) {
+        for location in locations {
+            if !location.path.is_absolute() {
+                location.path = cwd.join(&location.path);
+            }
+        }
+        for content in content {
+            if let ToolCallContent::Diff(diff) = content
+                && !diff.path.is_absolute()
+            {
+                diff.path = cwd.join(&diff.path);
+            }
+        }
+    }
+    match update {
+        SessionUpdate::ToolCall(tool) => paths(&mut tool.content, &mut tool.locations, cwd),
+        SessionUpdate::ToolCallUpdate(tool) => paths(
+            tool.fields.content.as_deref_mut().unwrap_or_default(),
+            tool.fields.locations.as_deref_mut().unwrap_or_default(),
+            cwd,
+        ),
+        _ => {}
+    }
 }
 
 // Validate the standard types, without translating to a provider-native format.

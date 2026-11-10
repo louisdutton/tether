@@ -1,7 +1,7 @@
 use crate::{model::*, providers::Provider, store::Store};
 use agent_client_protocol::v1::schema::{
     ContentBlock, McpCapabilities, PromptCapabilities, SessionConfigOption,
-    SessionConfigOptionValue, SessionUpdate,
+    SessionConfigOptionValue, SessionModeId, SessionModeState, SessionUpdate,
 };
 use std::{
     collections::BTreeMap,
@@ -33,6 +33,7 @@ pub struct Manager {
     store: StoreMutex<Option<Store>>,
     // Provider notifications wait until command results and authored inputs are saved.
     commands: Mutex<()>,
+    epochs: StoreMutex<BTreeMap<String, u64>>,
     events: broadcast::Sender<Event>,
     stop: CancellationToken,
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
@@ -60,6 +61,7 @@ impl Manager {
             root: root.canonicalize()?,
             store: StoreMutex::new(Some(Store::open(database)?)),
             commands: Mutex::new(()),
+            epochs: StoreMutex::new(BTreeMap::new()),
             events,
             stop: CancellationToken::new(),
             tasks: Mutex::new(Vec::new()),
@@ -163,6 +165,95 @@ impl Manager {
             .image(all(|c| c.image))
             .audio(all(|c| c.audio))
             .embedded_context(all(|c| c.embedded_context))
+    }
+    pub(crate) fn session_epoch(&self, id: &str) -> u64 {
+        self.epochs.lock().unwrap().get(id).copied().unwrap_or(0)
+    }
+    fn detached(&self, id: &str, kind: &str) {
+        let epoch = {
+            let mut epochs = self.epochs.lock().unwrap();
+            let epoch = epochs.entry(id.into()).or_default();
+            *epoch += 1;
+            *epoch
+        };
+        let _ = self.events.send(Event {
+            session_id: Some(id.into()),
+            turn_id: None,
+            kind: kind.into(),
+            data: serde_json::json!({"epoch":epoch}),
+        });
+    }
+    pub fn supports_close(&self) -> bool {
+        self.providers.values().all(|p| p.supports_close())
+    }
+    pub async fn modes(&self, id: &str) -> Result<Option<SessionModeState>> {
+        let session = self.stored(id)?;
+        match self.providers.get(&session.provider) {
+            Some(provider) => Ok(provider.modes(&session.binding().session_id).await?),
+            None => Ok(None),
+        }
+    }
+    pub async fn set_mode(&self, id: &str, mode: SessionModeId) -> Result<()> {
+        let _guard = self.commands.lock().await;
+        let session = self.stored(id)?;
+        let provider = self.provider(&session.provider)?;
+        if self.native(&session).await?.status != "running" {
+            provider
+                .resume(&session.binding().session_id, &session.mcp_servers)
+                .await?;
+        }
+        provider
+            .set_mode(&session.binding().session_id, mode)
+            .await?;
+        Ok(())
+    }
+    pub async fn delete(&self, id: &str) -> Result<()> {
+        let _guard = self.commands.lock().await;
+        let Some(session) = self.db(|db| db.get(id))? else {
+            return Ok(());
+        };
+        // Cleanup remains possible after a workspace moves or its provider goes
+        // offline. Do not resume or execute the native session just to delete it.
+        if let Some(provider) = self.providers.get(&session.provider)
+            && provider.ready()
+            && provider
+                .get(&session.binding().session_id)
+                .await
+                .is_ok_and(|native| native.status == "running")
+        {
+            return Err(Error::Busy);
+        }
+        self.db(|db| db.delete(id))?;
+        self.detached(id, "session.deleted");
+        Ok(())
+    }
+    pub async fn close(&self, id: &str) -> Result<()> {
+        let _guard = self.commands.lock().await;
+        let Some(mut session) = self.db(|db| db.get(id))? else {
+            return Ok(());
+        };
+        if !self.allowed(&session.cwd) {
+            return Ok(());
+        }
+        for binding in &session.bindings {
+            if let Some(provider) = self.providers.get(&binding.provider) {
+                let turns = provider.close(&binding.session_id).await?;
+                if session.kind == SessionKind::Managed {
+                    self.db(|db| {
+                        db.transaction(|db| {
+                            for turn in &turns {
+                                db.put_turn(id, &binding.provider, &binding.session_id, turn)?;
+                            }
+                            Ok(())
+                        })
+                    })?;
+                }
+            }
+        }
+        session.status = "unloaded".into();
+        self.db(|db| db.save(&session))?;
+        self.detached(id, "session.closed");
+        Ok(())
     }
     pub async fn session_updates(&self, id: &str) -> Result<Vec<SessionUpdate>> {
         let session = self.stored(id)?;

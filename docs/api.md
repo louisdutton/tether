@@ -28,6 +28,10 @@ external; provider login happens through the installed agent/native runtime.
 | `session/new` | Create a managed conversation with the default available agent |
 | `session/list` | List Tether conversations with optional cwd/cursor filtering |
 | `session/load` | Attach and replay shared history before responding |
+| `session/resume` | Attach without replaying conversation history |
+| `session/delete` | Remove Tether-owned session/history; repeated or unknown IDs succeed |
+| `session/close` | Cancel work and release native sessions when all adapters advertise close and load |
+| `session/set_mode` | Select an adapter-advertised mode; modes are returned on new/load/resume |
 | `session/set_config_option` | Select the agent or change an advertised native setting |
 | `session/prompt` | Forward ACP prompt blocks, stream updates, respond at completion |
 | `session/cancel` | Notify the agent to cancel the session's active turn |
@@ -159,9 +163,32 @@ session objects.
 
 Unknown methods return `-32601`, invalid parameters `-32602`, missing
 sessions/turns `-32002`, busy sessions `-32001` and storage/agent failures
-`-32603`. Native invalid-parameter errors retain their standard code.
+`-32603`. Native ACP errors retain their code, message and data, including prompt failures and authentication errors.
 
 References: [ACP v1](https://agentclientprotocol.com/protocol/v1/overview),
 [configuration](https://agentclientprotocol.com/protocol/v1/session-config-options),
 [session loading](https://agentclientprotocol.com/protocol/v1/session-setup),
 [extensions](https://agentclientprotocol.com/protocol/v1/extensibility).
+
+## Session cleanup and capability scope
+
+Delete removes Tether's conversation, bindings, authored inputs and transcript in
+one transaction. An active conversation returns `-32001`; cancel it first.
+Deletion remains available when its provider is offline or its cwd has moved.
+The original adapter-owned conversations are retained and may be explicitly
+adopted again as a new Tether identity. Deleted IDs cannot be loaded or resumed.
+Deletion invalidates attachments on all connected clients.
+
+Close retains the conversation and history. It forwards `session/close` to every
+native binding, waits for active prompts to settle, and invalidates attachments.
+Load or resume to continue. Unknown/already-closed IDs succeed. Close is only
+advertised when every configured adapter advertises native close and supports
+load; Tether does not pretend to release native resources through a no-op.
+
+Resume checks the stored cwd and MCP configuration just like load, but sends no
+historical messages. It fails if execution is unavailable. Load can still replay
+managed history offline. File paths in tool locations and diffs are absolute,
+including older stored updates: relative adapter paths use the session cwd.
+
+See [ACP v1 coverage](acp-conformance.md) for the audited method surface,
+capability boundaries, tests and remaining optional features.
