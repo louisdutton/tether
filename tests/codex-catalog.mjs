@@ -25,6 +25,7 @@ do {
 } while(cursor);
 assert.deepEqual(ids,["active-1","active-2","archived-1","archived-2"]);
 assert.deepEqual(calls.map(c=>[c.archived,c.cursor]),[[false,null],[false,"native-page-2"],[true,null],[true,"archive-page-2"]]);
+assert(calls.every(c=>c.useStateDbOnly === true));
 assert(calls.every(c=>Array.isArray(c.modelProviders)&&c.modelProviders.length===0));
 assert(calls.every(c=>c.sourceKinds.includes("subAgentThreadSpawn")));
 await adapter.ensureTetherSessionActive("archived-1");

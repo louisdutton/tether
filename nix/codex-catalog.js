@@ -10,6 +10,8 @@
       archived: page.archived,
       cursor: page.cursor,
       limit: 100,
+      // The native state database is the catalog. Avoid scanning every rollout on reads.
+      useStateDbOnly: true,
       modelProviders: [],
       sourceKinds: ["cli", "vscode", "exec", "appServer", "subAgent", "subAgentReview", "subAgentCompact", "subAgentThreadSpawn", "subAgentOther", "unknown"]
     });
