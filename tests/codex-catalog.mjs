@@ -44,3 +44,20 @@ const classified = await adapter.listSessions({});
 assert.deepEqual(classified.sessions.map(s=>s._meta.tether.internal), [true,true,false,false]);
 assert(classified.sessions.every(s=>s.updatedAt === "2026-11-10T09:00:00.000Z"));
 console.log("Codex catalog: all profiles, native pages, active/archived phases and archive reopening passed");
+
+const deletionCalls = [];
+adapter.codexClient.sendRequest = async request => { deletionCalls.push(request); return {}; };
+await adapter.deleteTetherSessionPermanently("existing");
+assert.deepEqual(deletionCalls, [{method:"thread/delete",params:{threadId:"existing"}}]);
+adapter.codexClient.sendRequest = async () => { throw Object.assign(new Error("no rollout found for thread id absent"), {code:-32600}); };
+await adapter.deleteTetherSessionPermanently("absent");
+for (const error of [
+  Object.assign(new Error("no rollout found for thread id different"), {code:-32600}),
+  Object.assign(new Error("no rollout found for thread id absent"), {code:-32603}),
+  Object.assign(new Error("permission denied"), {code:-32600}),
+  new Error("Disconnected"),
+]) {
+  adapter.codexClient.sendRequest = async () => { throw error; };
+  await assert.rejects(adapter.deleteTetherSessionPermanently("absent"), actual => actual === error);
+}
+console.log("Codex deletion: already absent is idempotent; all other failures propagate");

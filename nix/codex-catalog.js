@@ -41,3 +41,14 @@
       await this.codexClient.sendRequest({method: "thread/unarchive", params: {threadId: sessionId}});
     }
   }
+  async deleteTetherSessionPermanently(sessionId) {
+    try {
+      await this.codexClient.sendRequest({method: "thread/delete", params: {threadId: sessionId}});
+    } catch (error) {
+      // Codex reports missing rollouts as InvalidRequest, not a not-found result.
+      // Tether independently verifies every active/archived catalog page afterwards.
+      if (error?.code !== -32600 || error?.message !== `no rollout found for thread id ${sessionId}`) {
+        throw error;
+      }
+    }
+  }

@@ -15,7 +15,7 @@ for signature in ["  async loadSession(request, onSubscribed) {", "  async resum
     source = source.replace(signature, signature + "\n    await this.ensureTetherSessionActive(request.sessionId);", 1)
 archive = "await this.codexClient.threadArchive({ threadId: sessionId });"
 assert source.count(archive) == 1, "codex-acp delete implementation changed"
-source = source.replace(archive, 'await this.codexClient.sendRequest({method: "thread/delete", params: {threadId: sessionId}});', 1)
+source = source.replace(archive, 'await this.deleteTetherSessionPermanently(sessionId);', 1)
 registration = ".onRequest(methods.agent.session.delete, (ctx) => getAgent().deleteSession(ctx.params))"
 assert source.count(registration) == 1, "codex-acp delete registration changed"
 source = source.replace(registration, registration + '.onRequest("_tether/session/delete_permanently", zDeleteSessionRequest, (ctx) => getAgent().deleteSession(ctx.params))', 1)

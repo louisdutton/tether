@@ -147,6 +147,14 @@ try:
     peer.call("session/resume", params)
     peer.call("session/close", {"sessionId": archived_id})
     print("Archived conversation load/close/resume: passed", flush=True)
+    # Simulate a native conversation removed outside Tether, leaving a stale binding.
+    native = Peer([CODEX, "app-server"], env)
+    try:
+        native.call("initialize", {"clientInfo": {"name": "tether-orphan-proof", "version": "1.0"}})
+        native.send({"method": "initialized"})
+        native.call("thread/delete", {"threadId": original_ids[0]})
+    finally:
+        native.close()
     for native_id in original_ids:
         peer.call("session/delete", {"sessionId": mapping[native_id]})
     assert peer.call("session/list", {"_meta":{"tether":{"discover":True}}})["sessions"] == []
@@ -154,7 +162,7 @@ try:
     # The provider response and original files must agree with Tether's catalog.
     for native_id in original_ids:
         assert not list(home.glob(f"**/*{native_id}*.jsonl"))
-    print("Permanent deletion: active/archived native histories and Tether catalog removed", flush=True)
+    print("Permanent deletion: orphaned, active/archived native histories and Tether catalog removed", flush=True)
 finally:
     peer.close()
 
