@@ -670,6 +670,7 @@ impl Provider for AcpProvider {
                 "native deletion verification returned a repeated cursor"
             );
         }
+        self.shared.requests.cancel(id);
         self.shared.records.lock().unwrap().remove(id);
         self.shared
             .pending
@@ -689,6 +690,7 @@ impl Provider for AcpProvider {
         }
         self.request("session/close", json!({"sessionId":id}))
             .await?;
+        self.shared.requests.cancel(id);
         tokio::time::timeout(Duration::from_secs(30), async {
             while self.record(id)?.current.is_some() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -916,7 +918,8 @@ impl Provider for AcpProvider {
     async fn resume(&self, id: &str, mcp: &[McpServer]) -> Result<ProviderSession> {
         self.load(id, mcp).await
     }
-    async fn release(&self, _id: &str) -> Result<()> {
+    async fn release(&self, id: &str) -> Result<()> {
+        self.shared.requests.cancel(id);
         // Switching the active binding does not require destroying its native session.
         // Keeping it loaded avoids a second replay and preserves native caches.
         Ok(())
@@ -1050,7 +1053,9 @@ impl Provider for AcpProvider {
                     }
                 }
             }
-            state.requests.cancel(&id);
+            if kind != "turn.completed" {
+                state.requests.cancel(&id);
+            }
             state.emit(&id, Some(&native_turn), kind, data);
         });
         Ok(StartedTurn {
@@ -1059,9 +1064,9 @@ impl Provider for AcpProvider {
         })
     }
     async fn interrupt(&self, id: &str, _turn: &str) -> Result<()> {
-        self.shared.requests.cancel(id);
         self.cx
             .send_notification(CancelNotification::new(id.to_owned()))?;
+        self.shared.requests.cancel(id);
         Ok(())
     }
     async fn shutdown(&self) {

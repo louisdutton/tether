@@ -88,7 +88,8 @@ execution policies.
 
 Interactive permission requests and ACP form/URL elicitations wait for a client
 response. Pending requests belong to the agent turn and survive phone disconnects;
-agent cancellation, turn completion or server shutdown ends them. They are not
+agent cancellation, interrupted/failed turns, session close or server shutdown
+ends them. Non-blocking questions survive normal turn completion. They are not
 replayed after an agent/server restart. Tether does not advertise client filesystem
 or terminal services, and never automatically approves a request or retries a prompt.
 
@@ -190,3 +191,7 @@ alerts. Subsequent pages contain `events` (`session_id`, `turn_id`, `kind`), a n
 indicates the cursor has fallen outside that window. Store the cursor only after
 processing each page, and deduplicate live/replayed alerts by session, turn and
 kind. This journal contains result metadata, not transcript or tool-output replay.
+
+The packaged Codex adapter treats omitted/null deprecated `autoResolutionMs` as
+no timeout, including newer `isBlocking` requests. Explicit numeric timeouts are
+preserved. Regression checks execute the patched adapter's actual question handler.

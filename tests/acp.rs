@@ -1488,6 +1488,16 @@ async fn permissions_and_questions_wait_for_a_reconnected_client_and_validate_an
     f.manager.interrupt(&session.id, &turn).await.unwrap();
     f.finished(&session.id, 3).await;
     assert!(f.manager.client_requests().unwrap().is_empty());
+    f.send(&session.id, None, "ask-nonblocking").await;
+    f.finished(&session.id, 4).await;
+    let outstanding = f.manager.client_requests().unwrap();
+    assert_eq!(
+        outstanding.len(),
+        1,
+        "non-blocking questions must survive normal turn completion"
+    );
+    peer.cx.send_request(UntypedMessage::new("_tether/requests/respond",json!({"sessionId":session.id,"requestId":outstanding[0]["requestId"],"response":{"action":"accept","content":{"target":"phone"}}})).unwrap()).block_task().await.unwrap();
+    assert!(f.manager.client_requests().unwrap().is_empty());
     let replay = peer
         .cx
         .send_request(
@@ -1497,7 +1507,7 @@ async fn permissions_and_questions_wait_for_a_reconnected_client_and_validate_an
         .block_task()
         .await
         .unwrap();
-    assert_eq!(replay["events"].as_array().unwrap().len(), 3);
+    assert_eq!(replay["events"].as_array().unwrap().len(), 4);
     assert_eq!(replay["events"][2]["kind"], "turn.interrupted");
     let empty = peer
         .cx

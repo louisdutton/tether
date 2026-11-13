@@ -107,13 +107,14 @@ while IFS= read -r line; do
       user=$(jq -cn --arg text "$text" '{sessionUpdate:"user_message_chunk",content:{type:"text",text:$text}}')
       update "$user"
       printf '%s\n' "$user" >> "$state/$sid.history"
-      if [[ "$text" == *ask-permission* ]] || [[ "$text" == *ask-question* ]]; then
+      if [[ "$text" == *ask-permission* ]] || [[ "$text" == *ask-question* ]] || [[ "$text" == *ask-nonblocking* ]]; then
         pending=$request_id; pending_sid=$sid
         if [[ "$text" == *ask-permission* ]]; then
           jq -cn --arg sid "$sid" '{jsonrpc:"2.0",id:"agent-request",method:"session/request_permission",params:{sessionId:$sid,toolCall:{toolCallId:"approval",title:"Run build?"},options:[{optionId:"once",name:"Allow once",kind:"allow_once"},{optionId:"no",name:"Reject",kind:"reject_once"}]}}'
         else
           jq -cn --arg sid "$sid" '{jsonrpc:"2.0",id:"agent-request",method:"elicitation/create",params:{sessionId:$sid,mode:"form",message:"Choose a target",requestedSchema:{type:"object",properties:{target:{type:"string",oneOf:[{const:"phone",title:"Phone"},{const:"server",title:"Server"}]}},required:["target"]}}}'
         fi
+        if [[ "$text" == *ask-nonblocking* ]]; then pending=''; reply '{"stopReason":"end_turn"}'; fi
         continue
       fi
       if [[ "$text" == *slow* ]]; then pending=$request_id; pending_sid=$sid; continue; fi

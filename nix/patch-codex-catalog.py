@@ -33,5 +33,10 @@ source = source.replace(steer_fallback, '''    if (params._meta?.steering?.idleB
       return { outcome: "promptRequired", reason: "noRunningTurn" };
     }
 ''' + steer_fallback, 1)
+# New Codex versions deprecate autoResolutionMs in favour of isBlocking and
+# may omit it. Missing/null means no adapter-imposed timeout, not zero ms.
+question_timeout = "    if (params.autoResolutionMs === null) {"
+assert source.count(question_timeout) == 1, "codex-acp question timeout changed"
+source = source.replace(question_timeout, "    if (params.autoResolutionMs == null) {", 1)
 path.chmod(path.stat().st_mode | 0o200)
 path.write_text(source)
