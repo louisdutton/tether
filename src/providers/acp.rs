@@ -80,6 +80,7 @@ struct Record {
 struct Shared {
     records: Mutex<BTreeMap<String, Record>>,
     pending: Mutex<Vec<SessionNotification>>,
+    requests: super::requests::Requests,
     events: broadcast::Sender<Event>,
     ready: AtomicBool,
     path: PathBuf,
@@ -290,6 +291,7 @@ impl AcpProvider {
         let shared = Arc::new(Shared {
             records: Mutex::new(records),
             pending: Mutex::new(vec![]),
+            requests: Default::default(),
             events,
             ready: AtomicBool::new(false),
             path,
@@ -328,18 +330,38 @@ impl AcpProvider {
         let done = stop.clone();
         let state = shared.clone();
         let received = shared.clone();
+        let requester = shared.clone();
         let (ready, connection) = oneshot::channel();
         let task = tokio::spawn(async move {
             let result = Client.v1()
                 .on_receive_notification(async move |notification: SessionNotification, _cx| {
                     received.update(notification).map_err(|e| agent_client_protocol::Error::internal_error().data(e.to_string()))
                 }, agent_client_protocol::on_receive_notification!())
-                .on_receive_request(async move |_request: UntypedMessage, responder, _cx| {
-                    // No client filesystem/terminal capabilities are advertised. Permission
-                    // requests receive a standard cancelled outcome until a UI is connected.
-                    if _request.method() == "session/request_permission" {
-                        responder.respond_with_result(Ok::<_, agent_client_protocol::Error>(json!({"outcome":{"outcome":"cancelled"}})))
-                    } else { responder.respond_with_error(agent_client_protocol::Error::method_not_found()) }
+                .on_receive_request(async move |request: UntypedMessage, responder, cx| {
+                    let (method, params) = request.into_parts();
+                    if !matches!(method.as_str(), "session/request_permission" | "elicitation/create") {
+                        return responder.respond_with_error(agent_client_protocol::Error::method_not_found());
+                    }
+                    let session = params["sessionId"].as_str().unwrap_or("").to_owned();
+                    if !requester.records.lock().unwrap().contains_key(&session) {
+                        return responder.respond_with_error(agent_client_protocol::Error::invalid_params());
+                    }
+                    let (id, answer) = match requester.requests.begin(&session, &method, params) {
+                        Ok(pending) => pending,
+                        Err(e) => return responder.respond_with_error(agent_client_protocol::Error::invalid_params().data(e.to_string())),
+                    };
+                    requester.emit(&session, None, "client.requested", json!({"requestId":id}));
+                    let state = requester.clone();
+                    let cancellation = responder.cancellation();
+                    cx.spawn(async move {
+                        let answer = tokio::select! { result = answer => result.ok(), _ = cancellation.cancelled() => None };
+                        state.requests.forget(&id);
+                        let response = answer.unwrap_or_else(|| if method == "session/request_permission" {
+                            json!({"outcome":{"outcome":"cancelled"}})
+                        } else { json!({"action":"cancel"}) });
+                        state.emit(&session, None, "client.resolved", json!({"requestId":id}));
+                        responder.respond_with_result(Ok::<_, agent_client_protocol::Error>(response))
+                    })
                 }, agent_client_protocol::on_receive_request!())
                 .connect_with(transport, async move |cx| {
                     let _ = ready.send(cx.clone());
@@ -367,7 +389,14 @@ impl AcpProvider {
             Duration::from_secs(30),
             cx.send_request(
                 InitializeRequest::new(agent_client_protocol::schema::ProtocolVersion::V1)
-                    .client_info(Implementation::new("tether", env!("CARGO_PKG_VERSION"))),
+                    .client_info(Implementation::new("tether", env!("CARGO_PKG_VERSION")))
+                    .client_capabilities(
+                        ClientCapabilities::new().elicitation(
+                            ElicitationCapabilities::new()
+                                .form(ElicitationFormCapabilities::new())
+                                .url(ElicitationUrlCapabilities::new()),
+                        ),
+                    ),
             )
             .block_task(),
         )
@@ -513,6 +542,13 @@ impl AcpProvider {
 }
 #[async_trait]
 impl Provider for AcpProvider {
+    fn client_requests(&self) -> Vec<Value> {
+        self.shared.requests.list()
+    }
+    fn answer_request(&self, session: &str, id: &str, response: Value) -> Result<()> {
+        self.shared.requests.answer(session, id, response)
+    }
+
     fn supports_steering(&self) -> bool {
         self.steering
     }
@@ -1014,6 +1050,7 @@ impl Provider for AcpProvider {
                     }
                 }
             }
+            state.requests.cancel(&id);
             state.emit(&id, Some(&native_turn), kind, data);
         });
         Ok(StartedTurn {
@@ -1022,6 +1059,7 @@ impl Provider for AcpProvider {
         })
     }
     async fn interrupt(&self, id: &str, _turn: &str) -> Result<()> {
+        self.shared.requests.cancel(id);
         self.cx
             .send_notification(CancelNotification::new(id.to_owned()))?;
         Ok(())

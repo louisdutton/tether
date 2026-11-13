@@ -17,6 +17,7 @@ use tokio_util::{
 struct Peer {
     cx: ConnectionTo<Agent>,
     updates: Arc<Mutex<Vec<SessionNotification>>>,
+    events: Arc<Mutex<Vec<serde_json::Value>>>,
     stop: CancellationToken,
     task: tokio::task::JoinHandle<agent_client_protocol::Result<()>>,
 }
@@ -26,6 +27,8 @@ impl Peer {
         let done = stop.clone();
         let updates = Arc::new(Mutex::new(Vec::new()));
         let received = updates.clone();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let received_events = events.clone();
         let (ready, connection) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(async move {
             Client
@@ -33,6 +36,18 @@ impl Peer {
                 .on_receive_notification(
                     async move |update: SessionNotification, _cx| {
                         received.lock().unwrap().push(update);
+                        Ok(())
+                    },
+                    agent_client_protocol::on_receive_notification!(),
+                )
+                .on_receive_notification(
+                    async move |message: UntypedMessage, _cx| {
+                        if message.method() == "_tether/event" {
+                            received_events
+                                .lock()
+                                .unwrap()
+                                .push(message.params().clone());
+                        }
                         Ok(())
                     },
                     agent_client_protocol::on_receive_notification!(),
@@ -47,13 +62,22 @@ impl Peer {
         Self {
             cx: connection.await.unwrap(),
             updates,
+            events,
             stop,
             task,
         }
     }
     async fn initialize(&self) -> InitializeResponse {
         self.cx
-            .send_request(InitializeRequest::new(ProtocolVersion::V1))
+            .send_request(
+                InitializeRequest::new(ProtocolVersion::V1).client_capabilities(
+                    ClientCapabilities::new().meta(
+                        [("tether".into(), json!({"version":1}))]
+                            .into_iter()
+                            .collect::<Meta>(),
+                    ),
+                ),
+            )
             .block_task()
             .await
             .unwrap()
@@ -1298,4 +1322,191 @@ async fn steering_and_queue_extensions_deliver_fifo_after_the_original_client_di
         .unwrap();
     assert_eq!(listed["messages"], json!([]));
     close(f, reader, reader_stop, reader_task).await;
+}
+
+#[tokio::test]
+async fn list_only_clients_receive_live_status_without_transcript_attachments() {
+    let f = Fixture::new().await;
+    let (peer, stop, task) = connected(&f).await;
+    let init = peer.initialize().await;
+    assert_eq!(
+        init.agent_capabilities.meta.as_ref().unwrap()["tether"]["sessionStatus"],
+        true
+    );
+    let session = f.create("codex", tether::model::SessionKind::Managed).await;
+    let turn = f.send(&session.id, None, "slow task").await;
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if peer.events.lock().unwrap().iter().any(|e| {
+                e["kind"] == "session.status"
+                    && e["session_id"] == session.id
+                    && e["data"]["status"] == "running"
+            }) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(peer.updates.lock().unwrap().is_empty());
+    f.manager.interrupt(&session.id, &turn).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if peer.events.lock().unwrap().iter().any(|e| {
+                e["kind"] == "session.status"
+                    && e["session_id"] == session.id
+                    && e["data"]["status"] == "idle"
+                    && e["data"]["outcome"] == "turn.interrupted"
+            }) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(peer.updates.lock().unwrap().is_empty());
+    close(f, peer, stop, task).await;
+}
+
+#[tokio::test]
+async fn permissions_and_questions_wait_for_a_reconnected_client_and_validate_answers() {
+    let f = Fixture::new().await;
+    let (peer, stop, task) = connected(&f).await;
+    peer.initialize().await;
+    let baseline = peer
+        .cx
+        .send_request(UntypedMessage::new("_tether/events/list", json!({})).unwrap())
+        .block_task()
+        .await
+        .unwrap();
+    assert_eq!(baseline["events"], json!([]));
+    let session = f.create("codex", tether::model::SessionKind::Managed).await;
+    f.send(&session.id, None, "ask-permission").await;
+    let pending = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let requests = f.manager.client_requests().unwrap();
+            if let Some(request) = requests.first() {
+                break request.clone();
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(pending["sessionId"], session.id);
+    assert_eq!(pending["params"]["sessionId"], session.id);
+    assert_eq!(f.manager.get(&session.id).await.unwrap().status, "running");
+    peer.close().await;
+    stop.cancel();
+    let _ = task.await;
+    let (peer, stop, task) = connected(&f).await;
+    peer.initialize().await;
+    let listed = peer
+        .cx
+        .send_request(UntypedMessage::new("_tether/requests/list", json!({})).unwrap())
+        .block_task()
+        .await
+        .unwrap();
+    assert_eq!(listed["requests"][0]["requestId"], pending["requestId"]);
+    let response = |value| {
+        UntypedMessage::new(
+            "_tether/requests/respond",
+            json!({"sessionId":session.id,"requestId":pending["requestId"],"response":value}),
+        )
+        .unwrap()
+    };
+    assert!(
+        peer.cx
+            .send_request(response(
+                json!({"outcome":{"outcome":"selected","optionId":"unknown"}})
+            ))
+            .block_task()
+            .await
+            .is_err()
+    );
+    peer.cx
+        .send_request(response(
+            json!({"outcome":{"outcome":"selected","optionId":"once"}}),
+        ))
+        .block_task()
+        .await
+        .unwrap();
+    f.finished(&session.id, 1).await;
+    assert!(f.manager.client_requests().unwrap().is_empty());
+    f.send(&session.id, None, "ask-question").await;
+    let question = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if let Some(question) = f.manager.client_requests().unwrap().first() {
+                break question.clone();
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let response = |value| {
+        UntypedMessage::new(
+            "_tether/requests/respond",
+            json!({"sessionId":session.id,"requestId":question["requestId"],"response":value}),
+        )
+        .unwrap()
+    };
+    assert!(
+        peer.cx
+            .send_request(response(json!({"action":"accept","content":{}})))
+            .block_task()
+            .await
+            .is_err()
+    );
+    peer.cx
+        .send_request(response(
+            json!({"action":"accept","content":{"target":"phone"}}),
+        ))
+        .block_task()
+        .await
+        .unwrap();
+    f.finished(&session.id, 2).await;
+    assert!(
+        f.requests("codex")
+            .iter()
+            .any(|r| r["id"] == "agent-request" && r["result"]["content"]["target"] == "phone")
+    );
+    assert_eq!(
+        f.requests("codex")[0]["params"]["clientCapabilities"]["elicitation"]["form"],
+        json!({})
+    );
+    let turn = f.send(&session.id, None, "ask-question").await;
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while f.manager.client_requests().unwrap().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    f.manager.interrupt(&session.id, &turn).await.unwrap();
+    f.finished(&session.id, 3).await;
+    assert!(f.manager.client_requests().unwrap().is_empty());
+    let replay = peer
+        .cx
+        .send_request(
+            UntypedMessage::new("_tether/events/list", json!({"cursor":baseline["cursor"]}))
+                .unwrap(),
+        )
+        .block_task()
+        .await
+        .unwrap();
+    assert_eq!(replay["events"].as_array().unwrap().len(), 3);
+    assert_eq!(replay["events"][2]["kind"], "turn.interrupted");
+    let empty = peer
+        .cx
+        .send_request(
+            UntypedMessage::new("_tether/events/list", json!({"cursor":replay["cursor"]})).unwrap(),
+        )
+        .block_task()
+        .await
+        .unwrap();
+    assert_eq!(empty["events"], json!([]));
+    close(f, peer, stop, task).await;
 }

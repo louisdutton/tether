@@ -177,6 +177,20 @@ pub async fn serve(
                     }
                 };
                 let Some(id) = &event.session_id else { continue };
+                let extensions = state.lock().unwrap().extensions;
+                if extensions && matches!(event.kind.as_str(), "client.requested" | "client.resolved") {
+                    extension(&cx, value(&event)?)?;
+                    continue;
+                }
+                if extensions && (matches!(event.kind.as_str(), "turn.started" | "turn.completed" | "turn.interrupted" | "turn.failed" | "provider.unavailable" | "session.deleted" | "session.closed") ||
+                    (event.kind == "acp.session_update" && event.data["sessionUpdate"] == "session_info_update")) {
+                    if let Ok(session) = manager.get(id).await {
+                        extension(&cx, json!({"kind":"session.status","session_id":id,"turn_id":event.turn_id,
+                            "data":{"status":session.status,"cwd":session.cwd,"title":session.title,"updatedAt":session.updated_at,"outcome":event.kind}}))?;
+                    } else if event.kind == "session.deleted" {
+                        extension(&cx, json!({"kind":"session.deleted","session_id":id}))?;
+                    }
+                }
                 if matches!(event.kind.as_str(), "session.deleted" | "session.closed") {
                     let mut state = state.lock().unwrap();
                     // A delayed close event must not detach a newer resume/load.
@@ -228,7 +242,7 @@ async fn handle_request(
                 .delete(SessionDeleteCapabilities::new())
                 .resume(SessionResumeCapabilities::new())
                 .close(manager.supports_close().then(SessionCloseCapabilities::new)))
-            .meta([("tether".into(), json!({"version":1,"providers":true,"managedHistory":true,"agentSwitching":true,"directSessions":true,"sessionDiscovery":true,"messageQueue":true}))].into_iter().collect::<Meta>());
+            .meta([("tether".into(), json!({"version":1,"providers":true,"managedHistory":true,"agentSwitching":true,"directSessions":true,"sessionDiscovery":true,"messageQueue":true,"sessionStatus":true,"clientRequests":true,"eventReplay":true}))].into_iter().collect::<Meta>());
         return value(
             InitializeResponse::new(agent_client_protocol::schema::ProtocolVersion::V1)
                 .agent_info(Implementation::new("tether", env!("CARGO_PKG_VERSION")))
@@ -247,6 +261,32 @@ async fn handle_request(
         return Err(Error::invalid_request().data("initialize first"));
     }
     match method {
+        "_tether/events/list" => {
+            let cursor = payload
+                .get("cursor")
+                .and_then(Value::as_str)
+                .map(str::parse::<u64>)
+                .transpose()
+                .map_err(|_| Error::invalid_params().data("invalid monitoring cursor"))?;
+            value(manager.monitor_events(cursor).map_err(mapped)?)
+        }
+        "_tether/requests/list" => {
+            value(json!({"requests":manager.client_requests().map_err(mapped)?}))
+        }
+        "_tether/requests/respond" => {
+            #[derive(serde::Deserialize)]
+            #[serde(rename_all = "camelCase", deny_unknown_fields)]
+            struct Answer {
+                session_id: String,
+                request_id: String,
+                response: Value,
+            }
+            let request: Answer = params(payload)?;
+            manager
+                .answer_request(&request.session_id, &request.request_id, request.response)
+                .map_err(mapped)?;
+            value(json!({}))
+        }
         "_session/steering"
         | "_tether/session/queue"
         | "_tether/session/queue/list"

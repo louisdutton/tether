@@ -86,9 +86,11 @@ has no application credentials. Anyone reaching it can control its sessions.
 Workspace checks constrain session directories; agents own their sandbox and
 execution policies.
 
-Interactive permission requests receive ACP's cancelled outcome. Tether does
-not advertise client filesystem or terminal services. There is no approval UI,
-automatic prompt retry, durable transport replay or message idempotency key.
+Interactive permission requests and ACP form/URL elicitations wait for a client
+response. Pending requests belong to the agent turn and survive phone disconnects;
+agent cancellation, turn completion or server shutdown ends them. They are not
+replayed after an agent/server restart. Tether does not advertise client filesystem
+or terminal services, and never automatically approves a request or retries a prompt.
 
 ## NixOS
 
@@ -160,3 +162,31 @@ until the uncertain entry is reviewed and removed. Restarting during an active
 turn preserves subsequent queued messages as paused. Deleting a session deletes
 its backlog. Removing a queued message preserves its cancelled receipt so a late
 retry cannot enqueue it again.
+
+## Monitoring and interactive requests
+
+Opt in to `_tether/event` using `clientCapabilities._meta.tether`. The capabilities
+`agentCapabilities._meta.tether.sessionStatus`, `clientRequests`, and `eventReplay`
+are independently advertised. `session.status` events contain the public
+`session_id`, `turn_id`, and `data` with current `status`, `cwd`, `title`,
+`updatedAt`, and the triggering `outcome`. These lightweight events cover all
+allowed sessions without attaching to or replaying their transcripts. Treat
+unavailable/disconnected session state as unknown rather than idle.
+
+`_tether/requests/list` returns `requests` with stable `requestId`, public
+`sessionId`, standard ACP `method`, and unmodified request `params` except for the
+public session ID. `client.requested` and `client.resolved` events signal changes.
+Respond using `_tether/requests/respond` with `sessionId`, `requestId`, and a
+standard ACP `response` (`outcome` for permissions; `action`/`content` for
+`elicitation/create`). Attachment is not required. Invalid answers leave the
+request pending. Responses are consumed atomically; a second client's stale
+response fails instead of being applied to another question. Agent-side
+`$/cancel_request` withdraws the pending request.
+
+`_tether/events/list` recovers missed terminal-turn alerts using a string `cursor`.
+Without a cursor it establishes the current position and returns no historical
+alerts. Subsequent pages contain `events` (`session_id`, `turn_id`, `kind`), a new
+`cursor`, and `more`. The last 1024 terminal events are stored in SQLite; `truncated`
+indicates the cursor has fallen outside that window. Store the cursor only after
+processing each page, and deduplicate live/replayed alerts by session, turn and
+kind. This journal contains result metadata, not transcript or tool-output replay.

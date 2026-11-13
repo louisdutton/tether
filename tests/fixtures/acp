@@ -23,6 +23,12 @@ while IFS= read -r line; do
   method=$(jq -r '.method // ""' <<< "$line")
   sid=$(jq -r '.params.sessionId // ""' <<< "$line")
   case "$method" in
+    '')
+      if [ "$request_id" = '"agent-request"' ] && [ -n "$pending" ]; then
+        request_id=$pending; pending=''; reply '{"stopReason":"end_turn"}'
+      fi
+      ;;
+
     initialize)
       if [ -f "$state/no-close" ]; then close='{}'; else close='{"close":{}}'; fi
       reply "$(jq -cn --argjson close "$close" '{protocolVersion:1,_meta:{steering:{supported:true}},agentCapabilities:{loadSession:true,promptCapabilities:{image:true,embeddedContext:true},sessionCapabilities:({list:{}} + $close)}}')"
@@ -101,6 +107,15 @@ while IFS= read -r line; do
       user=$(jq -cn --arg text "$text" '{sessionUpdate:"user_message_chunk",content:{type:"text",text:$text}}')
       update "$user"
       printf '%s\n' "$user" >> "$state/$sid.history"
+      if [[ "$text" == *ask-permission* ]] || [[ "$text" == *ask-question* ]]; then
+        pending=$request_id; pending_sid=$sid
+        if [[ "$text" == *ask-permission* ]]; then
+          jq -cn --arg sid "$sid" '{jsonrpc:"2.0",id:"agent-request",method:"session/request_permission",params:{sessionId:$sid,toolCall:{toolCallId:"approval",title:"Run build?"},options:[{optionId:"once",name:"Allow once",kind:"allow_once"},{optionId:"no",name:"Reject",kind:"reject_once"}]}}'
+        else
+          jq -cn --arg sid "$sid" '{jsonrpc:"2.0",id:"agent-request",method:"elicitation/create",params:{sessionId:$sid,mode:"form",message:"Choose a target",requestedSchema:{type:"object",properties:{target:{type:"string",oneOf:[{const:"phone",title:"Phone"},{const:"server",title:"Server"}]}},required:["target"]}}}'
+        fi
+        continue
+      fi
       if [[ "$text" == *slow* ]]; then pending=$request_id; pending_sid=$sid; continue; fi
       update '{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"thinking"}}'
       update '{"sessionUpdate":"plan","entries":[{"content":"Inspect repository","priority":"medium","status":"completed"}]}'

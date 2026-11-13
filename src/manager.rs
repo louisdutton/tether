@@ -752,6 +752,52 @@ impl Manager {
             failures: snapshot.failures.clone(),
         })
     }
+    pub fn monitor_events(&self, cursor: Option<u64>) -> Result<serde_json::Value> {
+        let mut page = self.db(|db| db.monitor_events(cursor))?;
+        if let Some(events) = page["events"].as_array_mut() {
+            events.retain(|event| {
+                event["session_id"]
+                    .as_str()
+                    .is_some_and(|id| self.stored(id).is_ok())
+            });
+        }
+        Ok(page)
+    }
+    pub fn client_requests(&self) -> Result<Vec<serde_json::Value>> {
+        let mut requests = vec![];
+        for (name, provider) in &self.providers {
+            for mut request in provider.client_requests() {
+                let Some(native) = request["sessionId"].as_str() else {
+                    continue;
+                };
+                let Some(session) = self.db(|db| db.owner(name, native))? else {
+                    continue;
+                };
+                if !self.allowed(&session.cwd)
+                    || session.deletion_pending
+                    || session.provider != *name
+                {
+                    continue;
+                }
+                request["sessionId"] = session.id.clone().into();
+                request["params"]["sessionId"] = session.id.into();
+                requests.push(request);
+            }
+        }
+        Ok(requests)
+    }
+    pub fn answer_request(
+        &self,
+        id: &str,
+        request: &str,
+        response: serde_json::Value,
+    ) -> Result<()> {
+        let session = self.executable(id)?;
+        let binding = session.binding();
+        self.provider(&binding.provider)?
+            .answer_request(&binding.session_id, request, response)?;
+        Ok(())
+    }
     pub async fn get(&self, id: &str) -> Result<Session> {
         let mut session = self.stored(id)?;
         if session.deletion_pending {
@@ -1278,6 +1324,13 @@ impl Manager {
             {
                 event.data = serde_json::to_value(item).map_err(anyhow::Error::from)?;
             }
+        }
+        if matches!(
+            event.kind.as_str(),
+            "turn.completed" | "turn.interrupted" | "turn.failed"
+        ) && event.turn_id.is_some()
+        {
+            self.db(|db| db.monitor_event(&event))?;
         }
         let _ = self.events.send(event);
         Ok(())

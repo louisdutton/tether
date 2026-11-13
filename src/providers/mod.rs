@@ -1,4 +1,5 @@
 pub mod acp;
+pub mod requests;
 use agent_client_protocol::v1::schema::{
     ContentBlock, McpCapabilities, PromptCapabilities, SessionConfigOption,
     SessionConfigOptionValue, SessionModeId, SessionModeState, SessionUpdate,
@@ -12,6 +13,17 @@ use tokio::sync::broadcast;
 // Only operations needed by the pilot; wire formats stay inside each adapter.
 #[async_trait]
 pub trait Provider: Send + Sync {
+    fn client_requests(&self) -> Vec<serde_json::Value> {
+        vec![]
+    }
+    fn answer_request(
+        &self,
+        _session: &str,
+        _id: &str,
+        _response: serde_json::Value,
+    ) -> Result<()> {
+        anyhow::bail!("request no longer available")
+    }
     fn supports_steering(&self) -> bool {
         false
     }

@@ -38,6 +38,10 @@ impl Store {
                 sequence INTEGER PRIMARY KEY AUTOINCREMENT,
                 id TEXT NOT NULL UNIQUE, session_id TEXT NOT NULL,
                 state TEXT NOT NULL, body TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS monitoring_events (
+                sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL, turn_id TEXT NOT NULL, kind TEXT NOT NULL,
+                UNIQUE(session_id, turn_id, kind));
             CREATE TABLE IF NOT EXISTS inputs (
                 session_id TEXT NOT NULL, provider TEXT NOT NULL,
                 native_session TEXT NOT NULL, native_turn TEXT NOT NULL, text TEXT NOT NULL,
@@ -320,6 +324,51 @@ impl Store {
         .transpose()
     }
 
+    pub fn monitor_event(&self, event: &crate::model::Event) -> Result<()> {
+        self.0.execute(
+            "INSERT OR IGNORE INTO monitoring_events(session_id,turn_id,kind) VALUES(?1,?2,?3)",
+            params![event.session_id, event.turn_id, event.kind],
+        )?;
+        self.0.execute("DELETE FROM monitoring_events WHERE sequence < (SELECT COALESCE(MAX(sequence),0)-1023 FROM monitoring_events)", [])?;
+        Ok(())
+    }
+    pub fn monitor_events(&self, cursor: Option<u64>) -> Result<serde_json::Value> {
+        let head: i64 = self.0.query_row(
+            "SELECT COALESCE(MAX(sequence),0) FROM monitoring_events",
+            [],
+            |r| r.get(0),
+        )?;
+        let head = head as u64;
+        let Some(cursor) = cursor.filter(|cursor| *cursor <= head) else {
+            return Ok(serde_json::json!({"events":[],"cursor":head.to_string(),"more":false}));
+        };
+        let first: i64 = self.0.query_row(
+            "SELECT COALESCE(MIN(sequence),0) FROM monitoring_events",
+            [],
+            |r| r.get(0),
+        )?;
+        let first = first as u64;
+        let mut query = self.0.prepare("SELECT sequence,session_id,turn_id,kind FROM monitoring_events WHERE sequence>?1 ORDER BY sequence LIMIT 256")?;
+        let mut last = cursor;
+        let events = query
+            .query_map([cursor as i64], |r| {
+                Ok((
+                    r.get::<_, i64>(0)? as u64,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                ))
+            })?
+            .map(|row| {
+                let (sequence, session, turn, kind) = row?;
+                last = sequence;
+                Ok(serde_json::json!({"session_id":session,"turn_id":turn,"kind":kind}))
+            })
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(
+            serde_json::json!({"events":events,"cursor":last.to_string(),"more":last<head,"truncated":cursor+1<first}),
+        )
+    }
     pub fn history(&self, session: &str) -> Result<Vec<TranscriptTurn>> {
         let mut query = self.0.prepare(
             "SELECT id,sequence,provider,native_session,native_turn,body
@@ -347,5 +396,65 @@ impl Store {
             })
         })
         .collect()
+    }
+}
+
+#[cfg(test)]
+mod monitor_tests {
+    use super::*;
+    use crate::model::Event;
+    #[test]
+    fn monitoring_events_are_durable_deduplicated_and_bounded() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("events.sqlite3");
+        {
+            let store = Store::open(&path).unwrap();
+            assert_eq!(
+                store.monitor_events(None).unwrap()["events"],
+                serde_json::json!([])
+            );
+            let event = Event {
+                session_id: Some("s".into()),
+                turn_id: Some("t".into()),
+                kind: "turn.completed".into(),
+                data: serde_json::json!({}),
+            };
+            store.monitor_event(&event).unwrap();
+            store.monitor_event(&event).unwrap();
+            assert_eq!(
+                store.monitor_events(Some(0)).unwrap()["events"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
+        let store = Store::open(&path).unwrap();
+        assert_eq!(
+            store.monitor_events(Some(0)).unwrap()["events"][0]["turn_id"],
+            "t"
+        );
+        for i in 0..1030 {
+            store
+                .monitor_event(&Event {
+                    session_id: Some("s".into()),
+                    turn_id: Some(format!("t{i}")),
+                    kind: "turn.completed".into(),
+                    data: serde_json::json!({}),
+                })
+                .unwrap();
+        }
+        let first = store.monitor_events(Some(0)).unwrap();
+        assert_eq!(first["truncated"], true);
+        assert_eq!(first["more"], true);
+        let count: i64 = store
+            .0
+            .query_row("SELECT COUNT(*) FROM monitoring_events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1024);
+        assert_eq!(
+            store.monitor_events(Some(u64::MAX)).unwrap()["events"],
+            serde_json::json!([])
+        );
     }
 }
