@@ -12,6 +12,12 @@ use tokio::sync::broadcast;
 // Only operations needed by the pilot; wire formats stay inside each adapter.
 #[async_trait]
 pub trait Provider: Send + Sync {
+    fn supports_steering(&self) -> bool {
+        false
+    }
+    async fn steer(&self, _id: &str, _content: Vec<ContentBlock>) -> Result<bool> {
+        anyhow::bail!("agent does not support steering")
+    }
     fn supports_delete(&self) -> bool;
     async fn delete(&self, id: &str) -> Result<()>;
     fn supports_close(&self) -> bool;

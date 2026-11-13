@@ -128,3 +128,35 @@ adapter execution still needs a credentialed smoke test.
 
 See [ACP v1 coverage](docs/acp-conformance.md), [API](docs/api.md), [architecture](docs/architecture.md) and
 [interop references](docs/interop.md).
+
+### Messages during a running turn
+
+Tether passes through the capability-advertised `_session/steering` extension.
+`initialize._meta.steering.supported` is true when all configured agents support
+it. A steering request takes `sessionId` and `prompt` (ACP content blocks). Its
+result is `injected`, or `promptRequired` when the active turn has finished. The
+host then sends a normal `session/prompt`; the bundled Codex adapter honours
+`_meta.steering.idleBehavior = "promptRequired"` so it never creates a detached
+fallback turn behind Tether's back.
+
+`agentCapabilities._meta.tether.messageQueue` advertises a persistent queue:
+
+| Method | Parameters | Result |
+| --- | --- | --- |
+| `_tether/session/queue` | `sessionId`, stable `messageId`, `prompt` | Saved message receipt |
+| `_tether/session/queue/list` | `sessionId` | `messages` |
+| `_tether/session/queue/delete` | `sessionId`, `messageId` | Updated `messages` |
+| `_tether/session/queue/resume` | `sessionId`, paused `messageId` | Updated `messages` |
+
+These operations require attachment, just like prompting. The queue is stored
+before acknowledgement and executes FIFO, independently of client connections.
+Repeating an enqueue with the same ID and content returns its existing receipt;
+reusing an ID for different content fails. Clients subscribing to Tether events
+receive `queue.updated` with `data.messages` and `turn.started`/terminal events.
+Stopping or closing a session pauses its backlog. Failed/interrupted turns also
+pause it. A dispatch interrupted by a server crash is retained as `uncertain`
+and is never automatically resent; pending messages behind it remain blocked
+until the uncertain entry is reviewed and removed. Restarting during an active
+turn preserves subsequent queued messages as paused. Deleting a session deletes
+its backlog. Removing a queued message preserves its cancelled receipt so a late
+retry cannot enqueue it again.

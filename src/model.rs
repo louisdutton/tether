@@ -223,3 +223,13 @@ pub struct CatalogSnapshot {
     pub cwd: Option<String>,
     pub failures: Vec<CatalogFailure>,
 }
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct QueuedMessage {
+    pub message_id: String,
+    pub session_id: String,
+    pub prompt: Vec<agent_client_protocol::v1::schema::ContentBlock>,
+    pub state: String,
+    pub error: Option<String>,
+}

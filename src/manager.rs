@@ -1,3 +1,4 @@
+mod delivery;
 use crate::{model::*, providers::Provider, store::Store};
 use agent_client_protocol::v1::schema::{
     ContentBlock, McpCapabilities, PromptCapabilities, SessionConfigOption,
@@ -67,10 +68,16 @@ impl Manager {
             stop: CancellationToken::new(),
             tasks: Mutex::new(Vec::new()),
         });
-        for session in manager
+        for mut session in manager
             .db(|db| db.sessions())
             .map_err(|e| anyhow::anyhow!("reading stored sessions: {e:?}"))?
         {
+            if session.status == "running" {
+                session.status = "unloaded".into();
+                manager
+                    .db(|db| db.save(&session))
+                    .map_err(|e| anyhow::anyhow!("restoring session: {e:?}"))?;
+            }
             if session.kind == SessionKind::Managed {
                 for binding in session.bindings {
                     if let Some(provider) = manager.providers.get(&binding.provider) {
@@ -114,6 +121,7 @@ impl Manager {
             });
             manager.tasks.lock().await.push(task);
         }
+        manager.start_queue_worker().await;
         Ok(manager)
     }
 
@@ -266,6 +274,8 @@ impl Manager {
         if !self.allowed(&session.cwd) {
             return Ok(());
         }
+        self.db(|db| db.pause_queue(id))?;
+        self.queue_changed(id)?;
         for binding in &session.bindings {
             if let Some(provider) = self.providers.get(&binding.provider) {
                 let turns = provider.close(&binding.session_id).await?;
@@ -993,7 +1003,7 @@ impl Manager {
         &self,
         id: &str,
         request: Message,
-        mut content: Vec<ContentBlock>,
+        content: Vec<ContentBlock>,
     ) -> Result<String> {
         if content.is_empty()
             || content
@@ -1003,6 +1013,14 @@ impl Manager {
             return Err(Error::Invalid("text must not be empty".into()));
         }
         let _guard = self.commands.lock().await;
+        self.message_content_locked(id, request, content).await
+    }
+    async fn message_content_locked(
+        &self,
+        id: &str,
+        request: Message,
+        mut content: Vec<ContentBlock>,
+    ) -> Result<String> {
         let mut session = self.executable(id)?;
         if let Some(target) = &request.provider
             && target != &session.provider
@@ -1076,9 +1094,17 @@ impl Manager {
                 data: serde_json::to_value(item).map_err(anyhow::Error::from)?,
             });
         }
+        let _ = self.events.send(Event {
+            session_id: Some(id.into()),
+            turn_id: Some(turn_id.clone()),
+            kind: "turn.started".into(),
+            data: serde_json::json!({}),
+        });
         Ok(turn_id)
     }
     pub async fn interrupt(&self, id: &str, turn: &str) -> Result<()> {
+        self.db(|db| db.pause_queue(id))?;
+        self.queue_changed(id)?;
         let session = self.stored(id)?;
         self.native(&session).await?;
         let b = session.binding();
@@ -1140,6 +1166,17 @@ impl Manager {
                 event.data["updatedAt"].as_str().map(str::to_owned),
             );
             self.db(|db| db.save(&session))?;
+        }
+        if matches!(
+            event.kind.as_str(),
+            "turn.completed" | "turn.interrupted" | "turn.failed"
+        ) {
+            session.status = "idle".into();
+            self.db(|db| db.save(&session))?;
+            if event.kind != "turn.completed" {
+                self.db(|db| db.pause_queue(&session.id))?;
+                self.queue_changed(&session.id)?;
+            }
         }
         event.session_id = Some(session.id.clone());
         if event.kind == "acp.session_update"
@@ -1228,7 +1265,16 @@ impl Manager {
                     .content
                     .items
                     .iter()
-                    .find(|i| i.kind == "message.user")
+                    .find(|i| {
+                        i.id == event.data["id"].as_str().unwrap_or("") && i.kind == "message.user"
+                    })
+                    .or_else(|| {
+                        saved
+                            .content
+                            .items
+                            .iter()
+                            .find(|i| i.kind == "message.user")
+                    })
             {
                 event.data = serde_json::to_value(item).map_err(anyhow::Error::from)?;
             }
@@ -1237,6 +1283,7 @@ impl Manager {
         Ok(())
     }
     pub async fn shutdown(&self) {
+        self.stop.cancel();
         for provider in self.providers.values() {
             provider.shutdown().await;
         }

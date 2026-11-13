@@ -34,6 +34,10 @@ impl Store {
                 provider TEXT NOT NULL, native_session TEXT NOT NULL, native_turn TEXT NOT NULL,
                 body TEXT NOT NULL,
                 UNIQUE(session_id, provider, native_session, native_turn));
+            CREATE TABLE IF NOT EXISTS queued_messages (
+                sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                id TEXT NOT NULL UNIQUE, session_id TEXT NOT NULL,
+                state TEXT NOT NULL, body TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS inputs (
                 session_id TEXT NOT NULL, provider TEXT NOT NULL,
                 native_session TEXT NOT NULL, native_turn TEXT NOT NULL, text TEXT NOT NULL,
@@ -53,12 +57,19 @@ impl Store {
         // ACP exposes no receipt/turn lookup for an interrupted execution-server
         // lifetime. Preserve the input and mark unsettled work as ambiguous.
         let incomplete = db
-            .prepare("SELECT id,body FROM turns")?
-            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+            .prepare("SELECT id,body,session_id FROM turns")?
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        for (id, body) in incomplete {
+        for (id, body, session) in incomplete {
             let mut body: serde_json::Value = serde_json::from_str(&body)?;
             if body["status"] == "inProgress" {
+                db.execute("UPDATE queued_messages SET state='paused' WHERE session_id=?1 AND state='queued'", [&session])?;
                 body["status"] = "failed".into();
                 body["error"] = serde_json::json!({"message":"execution server restarted before turn settlement; delivery is unknown"});
                 db.execute(
@@ -67,7 +78,53 @@ impl Store {
                 )?;
             }
         }
+        // A crash after dispatch began has an unknown receipt. Never resend it.
+        db.execute(
+            "UPDATE queued_messages SET state='uncertain' WHERE state='dispatching'",
+            [],
+        )?;
         Ok(Self(db))
+    }
+
+    pub fn queue_message(&self, message: &crate::model::QueuedMessage) -> Result<()> {
+        self.0.execute(
+            "INSERT OR IGNORE INTO queued_messages(id,session_id,state,body) VALUES (?1,?2,?3,?4)",
+            params![
+                message.message_id,
+                message.session_id,
+                message.state,
+                serde_json::to_string(message)?
+            ],
+        )?;
+        Ok(())
+    }
+    pub fn queued(&self, session: Option<&str>) -> Result<Vec<crate::model::QueuedMessage>> {
+        let mut query = self.0.prepare("SELECT body,state FROM queued_messages WHERE (?1 IS NULL OR session_id=?1) ORDER BY sequence")?;
+        query
+            .query_map([session], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?
+            .map(|r| {
+                let (body, state) = r?;
+                let mut message: crate::model::QueuedMessage = serde_json::from_str(&body)?;
+                message.state = state;
+                Ok(message)
+            })
+            .collect()
+    }
+    pub fn queue_state(&self, id: &str, state: &str, error: Option<&str>) -> Result<()> {
+        self.0.execute(
+            "UPDATE queued_messages SET state=?2,body=json_set(body,'$.error',?3) WHERE id=?1",
+            params![id, state, error],
+        )?;
+        Ok(())
+    }
+    pub fn pause_queue(&self, session: &str) -> Result<()> {
+        self.0.execute(
+            "UPDATE queued_messages SET state='paused' WHERE session_id=?1 AND state='queued'",
+            [session],
+        )?;
+        Ok(())
     }
 
     pub fn transaction<T>(&self, f: impl FnOnce(&Self) -> Result<T>) -> Result<T> {
@@ -103,6 +160,7 @@ impl Store {
 
     pub fn delete(&self, id: &str) -> Result<()> {
         self.transaction(|db| {
+            db.0.execute("DELETE FROM queued_messages WHERE session_id=?1", [id])?;
             db.0.execute("DELETE FROM inputs WHERE session_id=?1", [id])?;
             db.0.execute("DELETE FROM turns WHERE session_id=?1", [id])?;
             db.0.execute("DELETE FROM sessions WHERE id=?1", [id])?;
@@ -188,7 +246,7 @@ impl Store {
             params![session_id, provider, native, turn.id], |r| r.get(0)).optional()?;
         if let Some(text) = input {
             // Keep the authored message in shared history, not the injected replay.
-            items.retain(|i| i.kind != "message.user");
+            items.retain(|i| i.kind != "message.user" || i.id.starts_with("steer:"));
             let content: Option<String> = self.0.query_row("SELECT content FROM inputs WHERE session_id=?1 AND provider=?2 AND native_session=?3 AND native_turn=?4", params![session_id, provider, native, turn.id], |r| r.get(0))?;
             let blocks: Vec<agent_client_protocol::v1::schema::ContentBlock> = content
                 .map(|v| serde_json::from_str(&v))

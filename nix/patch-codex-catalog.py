@@ -19,5 +19,19 @@ source = source.replace(archive, 'await this.deleteTetherSessionPermanently(sess
 registration = ".onRequest(methods.agent.session.delete, (ctx) => getAgent().deleteSession(ctx.params))"
 assert source.count(registration) == 1, "codex-acp delete registration changed"
 source = source.replace(registration, registration + '.onRequest("_tether/session/delete_permanently", zDeleteSessionRequest, (ctx) => getAgent().deleteSession(ctx.params))', 1)
+steer_parse = """    return {
+      sessionId,
+      prompt
+    };
+  }
+  createSessionConfigOptions"""
+assert source.count(steer_parse) == 1, "codex-acp steering parser changed"
+source = source.replace(steer_parse, steer_parse.replace("      prompt\n", '      prompt,\n      _meta: params["_meta"]\n'), 1)
+steer_fallback = "    return await this.startNewTurnFromSteering(params);"
+assert source.count(steer_fallback) == 1, "codex-acp steering fallback changed"
+source = source.replace(steer_fallback, '''    if (params._meta?.steering?.idleBehavior === "promptRequired") {
+      return { outcome: "promptRequired", reason: "noRunningTurn" };
+    }
+''' + steer_fallback, 1)
 path.chmod(path.stat().st_mode | 0o200)
 path.write_text(source)

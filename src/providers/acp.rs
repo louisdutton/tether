@@ -224,6 +224,7 @@ pub struct AcpProvider {
     permanent_delete: Option<DeleteCommand>,
     cx: ConnectionTo<Agent>,
     capabilities: AgentCapabilities,
+    steering: bool,
     shared: Arc<Shared>,
     stop: CancellationToken,
     task: tokio::sync::Mutex<Option<JoinHandle<()>>>,
@@ -389,6 +390,13 @@ impl AcpProvider {
             id: config.id,
             permanent_delete: config.permanent_delete,
             cx,
+            steering: response
+                .meta
+                .as_ref()
+                .and_then(|m| m.get("steering"))
+                .and_then(|v| v.get("supported"))
+                .and_then(Value::as_bool)
+                == Some(true),
             capabilities: response.agent_capabilities,
             shared,
             stop,
@@ -505,6 +513,58 @@ impl AcpProvider {
 }
 #[async_trait]
 impl Provider for AcpProvider {
+    fn supports_steering(&self) -> bool {
+        self.steering
+    }
+    async fn steer(&self, id: &str, content: Vec<ContentBlock>) -> Result<bool> {
+        ensure!(self.steering, "agent does not support steering");
+        let Some(turn_id) = self.record(id)?.current else {
+            return Ok(false);
+        };
+        let response = self
+            .request(
+                "_session/steering",
+                json!({
+                    "sessionId":id,"prompt":content,
+                    "_meta":{"steering":{"idleBehavior":"promptRequired"}}
+                }),
+            )
+            .await?;
+        match response["outcome"].as_str() {
+            Some("promptRequired") => return Ok(false),
+            Some("injected") => {}
+            _ => bail!("steering delivery could not be confirmed: {response}"),
+        }
+        // Native echoes are suppressed, as with ordinary authored input. Retain
+        // the accepted message in this turn before acknowledging it to the host.
+        let mut records = self.shared.records.lock().unwrap();
+        let record = records.get_mut(id).context("unknown ACP session")?;
+        let turn = record
+            .turns
+            .iter_mut()
+            .find(|t| t.id == turn_id)
+            .context("steered turn missing")?;
+        for block in content {
+            let item = Item {
+                id: format!("steer:{}", uuid::Uuid::new_v4()),
+                kind: "message.user".into(),
+                text: match &block {
+                    ContentBlock::Text(t) => Some(t.text.clone()),
+                    _ => None,
+                },
+                provider_data: serde_json::to_value(block)?,
+            };
+            turn.items.push(item.clone());
+            self.shared.emit(
+                id,
+                Some(&turn_id),
+                "message.user",
+                serde_json::to_value(item)?,
+            );
+        }
+        Ok(true)
+    }
+
     fn supports_delete(&self) -> bool {
         self.permanent_delete.is_some() && self.supports_close()
     }

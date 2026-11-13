@@ -25,7 +25,7 @@ while IFS= read -r line; do
   case "$method" in
     initialize)
       if [ -f "$state/no-close" ]; then close='{}'; else close='{"close":{}}'; fi
-      reply "$(jq -cn --argjson close "$close" '{protocolVersion:1,agentCapabilities:{loadSession:true,promptCapabilities:{image:true,embeddedContext:true},sessionCapabilities:({list:{}} + $close)}}')"
+      reply "$(jq -cn --argjson close "$close" '{protocolVersion:1,_meta:{steering:{supported:true}},agentCapabilities:{loadSession:true,promptCapabilities:{image:true,embeddedContext:true},sessionCapabilities:({list:{}} + $close)}}')"
       ;;
     session/new)
       count=$(cat "$state/counter" 2>/dev/null || printf 0)
@@ -78,6 +78,15 @@ while IFS= read -r line; do
         update "$(jq -cn --argjson options "$options" '{sessionUpdate:"config_option_update",configOptions:$options}')"
         reply "$(jq -cn --argjson options "$options" '{configOptions:$options}')"
       else error 'invalid config value'; fi
+      ;;
+    _session/steering)
+      if [ -n "$pending" ] && [ "$sid" = "$pending_sid" ]; then
+        steer_id=$request_id
+        text=$(jq -r '[.params.prompt[] | select(.type == "text") | .text] | join("\n")' <<< "$line")
+        reply '{"outcome":"injected"}'
+        if [[ "$text" == *finish* ]]; then request_id=$pending; pending=''; reply '{"stopReason":"end_turn"}'; fi
+        request_id=$steer_id
+      else reply '{"outcome":"promptRequired","reason":"noRunningTurn"}'; fi
       ;;
     session/prompt)
       text=$(jq -r '[.params.prompt[] | select(.type == "text") | .text] | join("\n")' <<< "$line")

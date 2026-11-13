@@ -28,6 +28,7 @@ struct State {
 #[derive(Default)]
 struct Active {
     cancel: CancellationToken,
+    turn: Mutex<Option<String>>,
 }
 #[derive(Default)]
 struct Output {
@@ -190,7 +191,11 @@ pub async fn serve(
                 }
                 let forward = {
                     let state = state.lock().unwrap();
-                    state.attached.get(id).copied() == Some(manager.session_epoch(id)) && !state.active.contains_key(id)
+                    state.attached.get(id).copied() == Some(manager.session_epoch(id))
+                        && (event.kind == "queue.updated" || !state.active.get(id).is_some_and(|active| {
+                            let turn = active.turn.lock().unwrap();
+                            turn.is_none() || event.turn_id.is_none() || *turn == event.turn_id
+                        }))
                         && !event.turn_id.as_ref().is_some_and(|turn| state.owned_turns.contains(&(id.clone(), turn.clone())))
                 };
                 if forward { forward_event(&state, &cx, &event)?; }
@@ -223,17 +228,60 @@ async fn handle_request(
                 .delete(SessionDeleteCapabilities::new())
                 .resume(SessionResumeCapabilities::new())
                 .close(manager.supports_close().then(SessionCloseCapabilities::new)))
-            .meta([("tether".into(), json!({"version":1,"providers":true,"managedHistory":true,"agentSwitching":true,"directSessions":true,"sessionDiscovery":true}))].into_iter().collect::<Meta>());
+            .meta([("tether".into(), json!({"version":1,"providers":true,"managedHistory":true,"agentSwitching":true,"directSessions":true,"sessionDiscovery":true,"messageQueue":true}))].into_iter().collect::<Meta>());
         return value(
             InitializeResponse::new(agent_client_protocol::schema::ProtocolVersion::V1)
                 .agent_info(Implementation::new("tether", env!("CARGO_PKG_VERSION")))
-                .agent_capabilities(capabilities),
+                .agent_capabilities(capabilities)
+                .meta(
+                    [(
+                        "steering".into(),
+                        json!({"supported":manager.supports_steering()}),
+                    )]
+                    .into_iter()
+                    .collect::<Meta>(),
+                ),
         );
     }
     if !state.lock().unwrap().initialized {
         return Err(Error::invalid_request().data("initialize first"));
     }
     match method {
+        "_session/steering"
+        | "_tether/session/queue"
+        | "_tether/session/queue/list"
+        | "_tether/session/queue/delete"
+        | "_tether/session/queue/resume" => {
+            let id = payload["sessionId"]
+                .as_str()
+                .ok_or_else(Error::invalid_params)?;
+            attached(manager, state, id)?;
+            if method == "_tether/session/queue/list" {
+                return Ok(json!({"messages":manager.queued_messages(id).map_err(mapped)?}));
+            }
+            if matches!(
+                method,
+                "_tether/session/queue/delete" | "_tether/session/queue/resume"
+            ) {
+                let message = payload["messageId"]
+                    .as_str()
+                    .ok_or_else(Error::invalid_params)?;
+                manager
+                    .change_queued_message(id, message, method.ends_with("/resume"))
+                    .await
+                    .map_err(mapped)?;
+                return Ok(json!({"messages":manager.queued_messages(id).map_err(mapped)?}));
+            }
+            let prompt: Vec<ContentBlock> = params(payload["prompt"].clone())?;
+            if method == "_session/steering" {
+                return manager.steer(id, prompt).await.map_err(mapped);
+            }
+            let message = payload["messageId"]
+                .as_str()
+                .ok_or_else(Error::invalid_params)?
+                .to_owned();
+            value(manager.enqueue(id, message, prompt).await.map_err(mapped)?)
+        }
         "session/new" => {
             let request: NewSessionRequest = params(payload)?;
             setup(
@@ -526,6 +574,7 @@ async fn prompt(
         .unwrap()
         .owned_turns
         .insert((id.clone(), turn.clone()));
+    *active.turn.lock().unwrap() = Some(turn.clone());
     let mut cancelled = false;
     loop {
         let event = tokio::select! {
@@ -556,7 +605,9 @@ async fn prompt(
         if event.turn_id.as_deref().is_some_and(|t| t != turn) {
             continue;
         }
-        forward_event(state, cx, &event)?;
+        if event.kind != "queue.updated" {
+            forward_event(state, cx, &event)?;
+        }
         match event.kind.as_str() {
             "turn.completed" | "turn.interrupted" => {
                 let mut response = serde_json::from_value::<PromptResponse>(event.data.clone())

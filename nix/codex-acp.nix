@@ -11,6 +11,7 @@ codex-acp.overrideAttrs (old: {
   postInstall = (old.postInstall or "") + ''
     python3 ${./patch-codex-catalog.py} "$out/lib/node_modules/@agentclientprotocol/codex-acp/dist/index.js" ${./codex-catalog.js}
     node --check "$out/lib/node_modules/@agentclientprotocol/codex-acp/dist/index.js"
+    node ${../tests/codex-steering.mjs} "$out/lib/node_modules/@agentclientprotocol/codex-acp/dist/index.js"
     node ${../tests/codex-catalog.mjs} ${./codex-catalog.js}
   '';
 })

@@ -1230,3 +1230,72 @@ async fn native_discovery_is_advertised_and_requires_explicit_list_metadata() {
     );
     close(f, peer, stop, task).await;
 }
+
+#[tokio::test]
+async fn steering_and_queue_extensions_deliver_fifo_after_the_original_client_disconnects() {
+    let f = Fixture::new().await;
+    let (peer, stop, task) = connected(&f).await;
+    let init = peer.initialize().await;
+    assert_eq!(init.meta.as_ref().unwrap()["steering"]["supported"], true);
+    assert_eq!(
+        init.agent_capabilities.meta.as_ref().unwrap()["tether"]["messageQueue"],
+        true
+    );
+    let id = peer.new_session(f.directory.path()).await;
+    let pending = tokio::spawn(
+        peer.cx
+            .send_request(PromptRequest::new(id.clone(), vec!["slow original".into()]))
+            .block_task(),
+    );
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while f.manager.get(&id.to_string()).await.unwrap().status != "running" {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let queued=peer.cx.send_request(UntypedMessage::new("_tether/session/queue",json!({"sessionId":id,"messageId":"q","prompt":[{"type":"text","text":"queued after disconnect"}]})).unwrap()).block_task().await.unwrap();
+    assert_eq!(queued["state"], "queued");
+    peer.close().await;
+    stop.cancel();
+    let _ = task.await;
+    let _ = pending.await;
+    let (reader, reader_stop, reader_task) = connected(&f).await;
+    reader.initialize().await;
+    reader
+        .cx
+        .send_request(ResumeSessionRequest::new(id.clone(), f.directory.path()))
+        .block_task()
+        .await
+        .unwrap();
+    let result = reader
+        .cx
+        .send_request(
+            UntypedMessage::new(
+                "_session/steering",
+                json!({"sessionId":id,"prompt":[{"type":"text","text":"finish original"}]}),
+            )
+            .unwrap(),
+        )
+        .block_task()
+        .await
+        .unwrap();
+    assert_eq!(result["outcome"], "injected");
+    f.finished(&id.to_string(), 2).await;
+    tokio::time::timeout(Duration::from_secs(3),async {
+        loop {
+            if reader.updates.lock().unwrap().iter().any(|u| matches!(&u.update,SessionUpdate::UserMessageChunk(c) if matches!(&c.content,ContentBlock::Text(t) if t.text=="queued after disconnect"))) { break; }
+            tokio::task::yield_now().await;
+        }
+    }).await.unwrap();
+    let listed = reader
+        .cx
+        .send_request(
+            UntypedMessage::new("_tether/session/queue/list", json!({"sessionId":id})).unwrap(),
+        )
+        .block_task()
+        .await
+        .unwrap();
+    assert_eq!(listed["messages"], json!([]));
+    close(f, reader, reader_stop, reader_task).await;
+}
