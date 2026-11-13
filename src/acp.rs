@@ -186,7 +186,7 @@ pub async fn serve(
                     (event.kind == "acp.session_update" && event.data["sessionUpdate"] == "session_info_update")) {
                     if let Ok(session) = manager.get(id).await {
                         extension(&cx, json!({"kind":"session.status","session_id":id,"turn_id":event.turn_id,
-                            "data":{"status":session.status,"cwd":session.cwd,"title":session.title,"updatedAt":session.updated_at,"outcome":event.kind}}))?;
+                            "data":{"status":session.status,"cwd":session.cwd,"title":session.title,"updatedAt":session.updated_at,"outcome":event.kind,"responsePreview":event.data["responsePreview"]}}))?;
                     } else if event.kind == "session.deleted" {
                         extension(&cx, json!({"kind":"session.deleted","session_id":id}))?;
                     }

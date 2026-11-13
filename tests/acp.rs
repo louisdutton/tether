@@ -1520,3 +1520,43 @@ async fn permissions_and_questions_wait_for_a_reconnected_client_and_validate_an
     assert_eq!(empty["events"], json!([]));
     close(f, peer, stop, task).await;
 }
+
+#[tokio::test]
+async fn list_only_clients_receive_response_previews_live_and_after_reconnect() {
+    let f = Fixture::new().await;
+    let (peer, stop, task) = connected(&f).await;
+    peer.initialize().await;
+    let session = f.create("codex", tether::model::SessionKind::Managed).await;
+    f.send(&session.id, None, "reply").await;
+    f.finished(&session.id, 1).await;
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if peer.events.lock().unwrap().iter().any(|event| {
+                event["kind"] == "session.status"
+                    && event["session_id"] == session.id
+                    && event["data"]["outcome"] == "turn.completed"
+                    && event["data"]["responsePreview"] == "hello"
+            }) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(peer.updates.lock().unwrap().is_empty());
+    stop.cancel();
+    task.await.unwrap().unwrap();
+    let (reader, stop, task) = connected(&f).await;
+    reader.initialize().await;
+    let page = reader
+        .cx
+        .send_request(UntypedMessage::new("_tether/events/list", json!({"cursor":"0"})).unwrap())
+        .block_task()
+        .await
+        .unwrap();
+    assert_eq!(page["events"][0]["responsePreview"], "hello");
+    assert_eq!(page["events"][0]["session_id"], session.id);
+    assert!(reader.updates.lock().unwrap().is_empty());
+    close(f, reader, stop, task).await;
+}

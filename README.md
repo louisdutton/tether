@@ -195,3 +195,10 @@ kind. This journal contains result metadata, not transcript or tool-output repla
 The packaged Codex adapter treats omitted/null deprecated `autoResolutionMs` as
 no timeout, including newer `isBlocking` requests. Explicit numeric timeouts are
 preserved. Regression checks execute the patched adapter's actual question handler.
+
+Terminal `session.status` events and `_tether/events/list` entries include an optional
+`responsePreview`: at most 2,048 Unicode characters from the last assistant message
+in that exact turn, plus an ellipsis when truncated. This supports message-like
+notifications without attaching to the session or refreshing native history. Thinking,
+tool output, and earlier turns are excluded. The existing workspace authorization
+and opted-in event access apply to previews as well.

@@ -760,6 +760,14 @@ impl Manager {
                     .as_str()
                     .is_some_and(|id| self.stored(id).is_ok())
             });
+            for event in events {
+                if let (Some(session), Some(turn)) =
+                    (event["session_id"].as_str(), event["turn_id"].as_str())
+                {
+                    event["responsePreview"] =
+                        self.db(|db| db.response_preview(session, turn))?.into();
+                }
+            }
         }
         Ok(page)
     }
@@ -1331,6 +1339,12 @@ impl Manager {
         ) && event.turn_id.is_some()
         {
             self.db(|db| db.monitor_event(&event))?;
+            if let Some(turn) = event.turn_id.as_deref() {
+                let preview = self.db(|db| db.response_preview(&session.id, turn))?;
+                if let Some(data) = event.data.as_object_mut() {
+                    data.insert("responsePreview".into(), preview.into());
+                }
+            }
         }
         let _ = self.events.send(event);
         Ok(())

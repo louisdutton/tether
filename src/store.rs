@@ -324,6 +324,22 @@ impl Store {
         .transpose()
     }
 
+    /// A bounded excerpt of the last assistant message in this exact public turn.
+    /// Never refresh native history or include tools, thoughts, or another turn.
+    pub fn response_preview(&self, session: &str, turn: &str) -> Result<Option<String>> {
+        let body: Option<String> = self
+            .0
+            .query_row(
+                "SELECT body FROM turns WHERE session_id=?1 AND id=?2",
+                params![session, turn],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let content: Option<TurnContent> =
+            body.map(|body| serde_json::from_str(&body)).transpose()?;
+        Ok(content.and_then(|content| response_preview(&content.items)))
+    }
+
     pub fn monitor_event(&self, event: &crate::model::Event) -> Result<()> {
         self.0.execute(
             "INSERT OR IGNORE INTO monitoring_events(session_id,turn_id,kind) VALUES(?1,?2,?3)",
@@ -399,10 +415,103 @@ impl Store {
     }
 }
 
+fn response_preview(items: &[Item]) -> Option<String> {
+    let assistant = |item: &Item| {
+        item.kind == "message.assistant"
+            || (item.kind == "acp.update"
+                && item.provider_data["sessionUpdate"] == "agent_message_chunk"
+                && item.provider_data["content"]["type"] == "text")
+    };
+    let end = items.iter().rposition(|item| {
+        assistant(item) && item.text.as_ref().is_some_and(|text| !text.is_empty())
+    })?;
+    let mut start = end;
+    if items[end].kind == "acp.update" {
+        while start > 0 && assistant(&items[start - 1]) && items[start - 1].kind == "acp.update" {
+            start -= 1;
+        }
+    }
+    let mut chars = items[start..=end]
+        .iter()
+        .filter_map(|item| item.text.as_deref())
+        .flat_map(str::chars);
+    let mut preview: String = chars.by_ref().take(2048).collect();
+    if chars.next().is_some() {
+        preview.push('…');
+    }
+    (!preview.trim().is_empty()).then_some(preview)
+}
+
 #[cfg(test)]
 mod monitor_tests {
     use super::*;
     use crate::model::Event;
+    #[test]
+    fn response_previews_are_turn_scoped_and_survive_reopening() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("previews.sqlite3");
+        let public;
+        {
+            let store = Store::open(&path).unwrap();
+            let chunk = |id: &str, text: &str, update: &str| Item {
+                id: id.into(),
+                kind: "acp.update".into(),
+                text: Some(text.into()),
+                provider_data: serde_json::json!({"sessionUpdate":update,"content":{"type":"text","text":text}}),
+            };
+            let turn = Turn {
+                id: "native".into(),
+                status: "completed".into(),
+                error: None,
+                items: vec![
+                    chunk("1", "Earlier commentary", "agent_message_chunk"),
+                    chunk("2", "secret thought", "agent_thought_chunk"),
+                    chunk("3", "Final ", "agent_message_chunk"),
+                    chunk("4", "answer 😀", "agent_message_chunk"),
+                ],
+            };
+            public = store
+                .put_turn("s", "codex", "native-session", &turn)
+                .unwrap()
+                .id;
+            assert_eq!(
+                store.response_preview("s", &public).unwrap().as_deref(),
+                Some("Final answer 😀")
+            );
+            assert_eq!(
+                store.response_preview("other-session", &public).unwrap(),
+                None
+            );
+            assert_eq!(store.response_preview("s", "other-turn").unwrap(), None);
+        }
+        let store = Store::open(&path).unwrap();
+        assert_eq!(
+            store.response_preview("s", &public).unwrap().as_deref(),
+            Some("Final answer 😀")
+        );
+    }
+
+    #[test]
+    fn response_previews_exclude_tool_and_thought_text_and_bound_unicode() {
+        let item = |kind: &str, text: String| Item {
+            id: kind.into(),
+            kind: kind.into(),
+            text: Some(text),
+            provider_data: serde_json::Value::Null,
+        };
+        assert_eq!(
+            response_preview(&[item("tool.activity", "private tool output".into())]),
+            None
+        );
+        let preview = response_preview(&[
+            item("message.assistant", "😀".repeat(3000)),
+            item("tool.activity", "private tool output".into()),
+        ])
+        .unwrap();
+        assert_eq!(preview.chars().count(), 2049);
+        assert!(preview.ends_with("😀…"));
+    }
+
     #[test]
     fn monitoring_events_are_durable_deduplicated_and_bounded() {
         let directory = tempfile::tempdir().unwrap();
